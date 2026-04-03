@@ -829,7 +829,9 @@ async def cmd_add_blackout(message: Message, state: FSMContext, settings: Settin
     await state.set_state(AdminBlackoutStates.waiting_start)
     await message.answer(
         "Окно недоступности для <b>всех ваших управляемых вещей</b>.\n\n"
-        "Будут сняты пересекающиеся <b>брони</b> и <b>ожидающие выдачи заявки</b> по каждой из них.\n\n"
+        "Будут сняты <b>брони</b> и <b>ожидающие выдачи заявки</b>, у которых "
+        "<b>начало слота</b> попадает в это окно (если начало раньше окна, а дальше слот только пересекается — "
+        "бронь остаётся).\n\n"
         "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
         parse_mode=ParseMode.HTML,
     )

@@ -10,7 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
-from bot.services.booking_schedule import intervals_overlap
 from bot.services.rental import ensure_utc
 from bot.time_format import format_local_time
 
@@ -37,6 +36,16 @@ def blackout_user_cancel_rental_text(
     )
 
 
+def _handover_start_inside_blackout(
+    slot_start: datetime, bo_start: datetime, bo_end: datetime
+) -> bool:
+    """Начало выдачи попадает в [bo_start, bo_end)? Пересечение слота с blackout без этого не отменяем."""
+    rs, bs, be = ensure_utc(slot_start), ensure_utc(bo_start), ensure_utc(bo_end)
+    if rs is None or bs is None or be is None or be <= bs:
+        return False
+    return bs <= rs < be
+
+
 async def cancel_reservations_hit_by_blackout(
     session: AsyncSession,
     bot: Bot,
@@ -45,7 +54,7 @@ async def cancel_reservations_hit_by_blackout(
     bo_start: datetime,
     bo_end: datetime,
 ) -> int:
-    """Удаляет брони вещи, пересекающиеся с [bo_start, bo_end); уведомляет пользователей. Возвращает число удалённых."""
+    """Удаляет брони, у которых начало слота попадает в окно blackout; уведомляет. Пересечение «внутри аренды» допустимо."""
     bs, be = ensure_utc(bo_start), ensure_utc(bo_end)
     if bs is None or be is None or be <= bs:
         return 0
@@ -55,7 +64,7 @@ async def cancel_reservations_hit_by_blackout(
         rs, re_ = ensure_utc(res.start_at), ensure_utc(res.end_at)
         if rs is None or re_ is None:
             continue
-        if not intervals_overlap(rs, re_, bs, be):
+        if not _handover_start_inside_blackout(rs, bs, be):
             continue
         text = blackout_user_cancel_text(item, res, settings)
         uid = res.user_id
@@ -80,7 +89,7 @@ async def cancel_pending_rentals_hit_by_blackout(
     bo_start: datetime,
     bo_end: datetime,
 ) -> int:
-    """Снимает pending_admin заявки, пересекающиеся с окном; уведомляет пользователей и правит сообщение админу."""
+    """Снимает pending_admin заявки, если начало слота попадает в blackout; уведомляет и правит сообщение админу."""
     bs, be = ensure_utc(bo_start), ensure_utc(bo_end)
     if bs is None or be is None or be <= bs:
         return 0
@@ -95,7 +104,7 @@ async def cancel_pending_rentals_hit_by_blackout(
         rs, re_ = ensure_utc(rental.start_at), ensure_utc(rental.end_at)
         if rs is None or re_ is None:
             continue
-        if not intervals_overlap(rs, re_, bs, be):
+        if not _handover_start_inside_blackout(rs, bs, be):
             continue
         text = blackout_user_cancel_rental_text(item, rental, settings)
         uid = rental.user_id

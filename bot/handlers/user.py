@@ -42,6 +42,7 @@ from bot.services.admin_notify import (
 )
 from bot.services.booking_schedule import (
     explain_booking_start_conflict,
+    format_user_booking_availability_block,
     load_blackout_intervals_utc,
     load_rr_busy_intervals_utc,
     max_hours_from_start,
@@ -377,8 +378,12 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
         await query.answer("Вещь не найдена", show_alert=True)
         return
     notice = ""
+    avail_html = ""
     async with db_session.async_session_maker() as session:
         notice = await near_ban_notice_for_user(session, query.from_user.id)
+        avail_html = await format_user_booking_availability_block(
+            session, item_id, book_item, settings, now=datetime.now(UTC)
+        )
         await session.commit()
     await state.clear()
     await state.set_state(UserBookStates.waiting_start_datetime)
@@ -387,7 +392,8 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
         "Введите дату и время <b>начала</b> брони.\n"
         "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
         "Пример: <code>04.05.2026 10:00</code>\n\n"
-        "Свободные слоты не пересекаются с чужими бронями.",
+        "Ниже — когда можно выбрать начало с учётом минимальной аренды; "
+        "слот не должен пересекаться с чужими бронями.\n\n",
     ]
     if st.in_blackout and st.blackout_until is not None:
         lines.append(
@@ -397,6 +403,8 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
     lines.append(booking_rules_block())
     if notice:
         lines.append(notice)
+    lines.append("\n\n")
+    lines.append(avail_html)
     await query.message.answer(
         "".join(lines),
         reply_markup=home_keyboard(),
@@ -451,18 +459,30 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
         rr = await load_rr_busy_intervals_utc(session, item_id)
         bo = await load_blackout_intervals_utc(session, item_id)
         if point_inside_busy(parsed, bo) or point_inside_busy(parsed, rr):
-            await session.rollback()
             msg = await explain_booking_start_conflict(session, item_id, parsed, settings)
-            await message.answer(msg, reply_markup=home_keyboard())
+            avail = await format_user_booking_availability_block(
+                session, item_id, item, settings, now=now
+            )
+            await session.rollback()
+            await message.answer(
+                msg + "\n\n" + avail,
+                reply_markup=home_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
             return
         lo, hi = rent_lo_hi(item)
         max_h = max_hours_from_start(parsed, rr, lo, hi)
         if max_h < lo:
+            avail = await format_user_booking_availability_block(
+                session, item_id, item, settings, now=now
+            )
             await session.rollback()
             await message.answer(
                 f"После выбранного начала до ближайшей брони или аренды меньше {lo} ч. "
-                "Выберите другое время или более короткую «щель» не подходит под правила аренды.",
+                "Выберите другое время — ниже подсказка по свободным окнам.\n\n"
+                + avail,
                 reply_markup=home_keyboard(),
+                parse_mode=ParseMode.HTML,
             )
             return
         await session.commit()

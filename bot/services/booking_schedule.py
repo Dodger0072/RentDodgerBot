@@ -214,6 +214,156 @@ def rent_lo_hi(item: Item) -> tuple[int, int]:
     return rent_hours_bounds(item)
 
 
+_AVAIL_UI_MAX_LINES = 14
+_AVAIL_TAIL_HORIZON_DAYS = 800
+
+
+def merge_intervals_utc(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    cleaned: list[tuple[datetime, datetime]] = []
+    for s, e in intervals:
+        su, eu = ensure_utc(s), ensure_utc(e)
+        if su is None or eu is None or eu <= su:
+            continue
+        cleaned.append((su, eu))
+    if not cleaned:
+        return []
+    cleaned.sort(key=lambda x: x[0])
+    out: list[tuple[datetime, datetime]] = [cleaned[0]]
+    for s, e in cleaned[1:]:
+        ps, pe = out[-1]
+        if s <= pe:
+            out[-1] = (ps, max(pe, e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _subtract_blackout_from_segments(
+    segs: list[tuple[datetime, datetime]],
+    bs: datetime,
+    be: datetime,
+) -> list[tuple[datetime, datetime]]:
+    out: list[tuple[datetime, datetime]] = []
+    for sa, se in segs:
+        if not (sa < be and bs < se):
+            out.append((sa, se))
+            continue
+        if sa < bs:
+            left_end = min(se, bs)
+            if left_end > sa:
+                out.append((sa, left_end))
+        if be < se:
+            rb = max(sa, be)
+            if se > rb:
+                out.append((rb, se))
+    return out
+
+
+def free_segments_excluding_blackout(
+    a: datetime,
+    b: datetime,
+    bo_merged: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Подотрезки [a,b), где можно выбрать момент начала (не внутри blackout)."""
+    au, bu = ensure_utc(a), ensure_utc(b)
+    if au is None or bu is None or bu <= au:
+        return []
+    segs = [(au, bu)]
+    for bs, be in bo_merged:
+        if not segs:
+            break
+        segs = _subtract_blackout_from_segments(segs, bs, be)
+    return [(s, e) for s, e in segs if e > s]
+
+
+async def format_user_booking_availability_block(
+    session: AsyncSession,
+    item_id: int,
+    item: Item,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """HTML: окна времени начала брони с учётом минимума часов до ближайшей RR-занятости."""
+    now_u = ensure_utc(now) or datetime.now(UTC)
+    lo, hi = rent_lo_hi(item)
+    rr = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
+    bo = merge_intervals_utc(await load_blackout_intervals_utc(session, item_id))
+    cursor = now_u
+    lines: list[str] = []
+    horizon = cursor + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
+
+    def add_finite(sa: datetime, se: datetime) -> None:
+        nonlocal lines
+        if len(lines) >= _AVAIL_UI_MAX_LINES:
+            return
+        latest = se - timedelta(hours=lo)
+        if latest < sa:
+            return
+        busy_lbl = format_local_time(se, settings)
+        lines.append(
+            f"• с <b>{format_local_time(sa, settings)}</b> до <b>{format_local_time(latest, settings)}</b>\n"
+            f"  <i>время начала; при мин. {lo} ч следующая бронь/аренда с {busy_lbl}</i>"
+        )
+
+    def add_open(sa: datetime) -> None:
+        nonlocal lines
+        if len(lines) >= _AVAIL_UI_MAX_LINES:
+            return
+        lines.append(
+            f"• с <b>{format_local_time(sa, settings)}</b>\n"
+            f"  <i>в очереди нет ближайшей брони/аренды; длительность от {lo} до {hi} ч "
+            f"(не дольше {MAX_RENT_HOURS} ч подряд от начала)</i>"
+        )
+
+    for s, e in rr:
+        su, eu = ensure_utc(s), ensure_utc(e)
+        if su is None or eu is None:
+            continue
+        if cursor < su:
+            for sa, se in free_segments_excluding_blackout(cursor, su, bo):
+                if len(lines) >= _AVAIL_UI_MAX_LINES:
+                    break
+                add_finite(sa, se)
+        if cursor < eu:
+            cursor = eu
+        if len(lines) >= _AVAIL_UI_MAX_LINES:
+            break
+
+    if len(lines) < _AVAIL_UI_MAX_LINES:
+        for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
+            if len(lines) >= _AVAIL_UI_MAX_LINES:
+                break
+            near_horizon = se >= horizon - timedelta(minutes=1)
+            latest = se - timedelta(hours=lo)
+            if latest < sa:
+                continue
+            if near_horizon:
+                add_open(sa)
+            else:
+                add_finite(sa, se)
+
+    if not lines:
+        return (
+            "<b>Когда можно начать бронь</b>\n"
+            f"Подходящих окон под минимум <b>{lo} ч</b> сейчас нет — выберите другую дату "
+            "или зайдите позже."
+        )
+
+    tail = ""
+    if len(lines) >= _AVAIL_UI_MAX_LINES:
+        tail = "\n<i>…показаны первые окна.</i>"
+
+    head = (
+        "<b>Когда можно начать бронь</b>\n"
+        f"<i>Вторая дата — последнее подходящее <b>начало</b> слота при минимуме {lo} ч "
+        f"до следующей брони или аренды.</i>\n\n"
+    )
+    return head + "\n".join(lines) + tail
+
+
 async def validate_new_reservation(
     session: AsyncSession,
     item_id: int,
