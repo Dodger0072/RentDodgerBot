@@ -144,7 +144,7 @@ def _compute_immediate_rent_cap_hours(
     lo: int,
     hi: int,
 ) -> int:
-    """Макс. целое h в [lo..hi], чтобы [now, now+h) не пересекался с занятыми интервалами."""
+    """Макс. целое h в [lo..hi], чтобы [now, now+h) не пересекался с бронями и арендами (RR, не blackout)."""
     from bot.services.booking_schedule import point_inside_busy, reservation_fits
 
     now_u = ensure_utc(now) or datetime.now(UTC)
@@ -225,7 +225,7 @@ async def items_availability_batch(
     for row in r_bo.scalars():
         bo_by[row.item_id].append(row)
 
-    from bot.services.booking_schedule import load_busy_intervals_utc, next_busy_start_after
+    from bot.services.booking_schedule import load_rr_busy_intervals_utc, next_busy_start_after
 
     r_items = await session.execute(select(Item).where(Item.id.in_(item_ids)))
     items_map: dict[int, Item] = {it.id: it for it in r_items.scalars().all()}
@@ -254,7 +254,7 @@ async def items_availability_batch(
         bu = blackout_max_end_covering_now(bo_list, ref_now)
         in_bo = bu is not None
 
-        busy = await load_busy_intervals_utc(session, iid)
+        busy = await load_rr_busy_intervals_utc(session, iid)
         busy_eff = _busy_intervals_still_relevant(ref_now, busy)
         nxt_after = next_busy_start_after(ref_now, busy_eff) if busy_eff else None
         lo, hi = rent_hours_bounds(item)
@@ -336,7 +336,7 @@ def next_booking_start_utc(
 
 
 async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus | None:
-    from bot.services.booking_schedule import load_busy_intervals_utc, next_busy_start_after
+    from bot.services.booking_schedule import load_rr_busy_intervals_utc, next_busy_start_after
 
     await expire_expired_rentals(session)
     item, rentals, reservations = await _load_item_rentals_reservations(session, item_id)
@@ -366,7 +366,7 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
     in_rs = res_cov is not None
     res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
 
-    busy = await load_busy_intervals_utc(session, item_id)
+    busy = await load_rr_busy_intervals_utc(session, item_id)
     busy_eff = _busy_intervals_still_relevant(now, busy)
     nxt_after = next_busy_start_after(now, busy_eff) if busy_eff else None
     lo, hi = rent_hours_bounds(item)

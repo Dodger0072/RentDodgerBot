@@ -42,7 +42,8 @@ from bot.services.admin_notify import (
 )
 from bot.services.booking_schedule import (
     explain_booking_start_conflict,
-    load_busy_intervals_utc,
+    load_blackout_intervals_utc,
+    load_rr_busy_intervals_utc,
     max_hours_from_start,
     max_reservation_end_utc,
     parse_booking_start_text,
@@ -280,7 +281,7 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         extra = "\n\n✅ <b>Статус:</b> можно взять в аренду сейчас."
         if st.immediate_rent_max_hours < hi_i:
             extra += (
-                f"\nДо ближайшей занятости можно взять не более "
+                f"\nДо ближайшей брони или занятой аренды можно взять не более "
                 f"<b>{st.immediate_rent_max_hours}</b> ч."
             )
         b.row(InlineKeyboardButton(text="Взять в аренду", callback_data=f"take:{item_id}"))
@@ -289,14 +290,13 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         hint_next = ""
         if st.next_busy_after is not None:
             hint_next = (
-                f"\n\nБлижайшее начало занятости по данным бота: "
-                f"<b>{_fmt_utc_local(st.next_busy_after, settings)}</b> "
-                f"(если это не та бронь, что в списке — ищите ещё слот, блэкаут или заявку)."
+                f"\n\nБлижайшее начало брони или аренды по данным бота: "
+                f"<b>{_fmt_utc_local(st.next_busy_after, settings)}</b>."
             )
         extra = (
             f"\n\n📅 <b>Статус:</b> сейчас нельзя взять сразу: минимальный срок для этой вещи "
-            f"<b>{st.min_rent_hours}</b> ч., а без пересечений с бронями, заявками и недоступностью "
-            f"укладывается не более <b>{st.immediate_rent_max_hours}</b> ч.{hint_next}"
+            f"<b>{st.min_rent_hours}</b> ч., а период не может пересечься с чужой бронью или арендой "
+            f"дольше, чем <b>{st.immediate_rent_max_hours}</b> ч.{hint_next}"
             f"\n\nНажмите «Забронировать», чтобы выбрать время в свободном слоте."
         )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
@@ -347,7 +347,7 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
     await state.update_data(item_id=item_id, flow="rent", immediate_max_hours=hi_cap)
     hours_line = (
         f"Укажите срок аренды в часах (целое число от {lo} до {hi_cap}; "
-        f"не больше окна до ближайшей занятости):"
+        f"не дольше, чем до ближайшей брони или занятой аренды):"
     )
     await query.message.answer(
         hours_line + notice,
@@ -448,25 +448,26 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
             await state.clear()
             await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
             return
-        busy = await load_busy_intervals_utc(session, item_id)
-        if point_inside_busy(parsed, busy):
+        rr = await load_rr_busy_intervals_utc(session, item_id)
+        bo = await load_blackout_intervals_utc(session, item_id)
+        if point_inside_busy(parsed, bo) or point_inside_busy(parsed, rr):
             await session.rollback()
             msg = await explain_booking_start_conflict(session, item_id, parsed, settings)
             await message.answer(msg, reply_markup=home_keyboard())
             return
         lo, hi = rent_lo_hi(item)
-        max_h = max_hours_from_start(parsed, busy, lo, hi)
+        max_h = max_hours_from_start(parsed, rr, lo, hi)
         if max_h < lo:
             await session.rollback()
             await message.answer(
-                f"После выбранного начала до ближайшей занятости меньше {lo} ч. "
+                f"После выбранного начала до ближайшей брони или аренды меньше {lo} ч. "
                 "Выберите другое время или более короткую «щель» не подходит под правила аренды.",
                 reply_markup=home_keyboard(),
             )
             return
         await session.commit()
 
-    cap_end = max_reservation_end_utc(parsed, busy)
+    cap_end = max_reservation_end_utc(parsed, rr)
     await state.update_data(book_start_iso=parsed.isoformat())
     await state.set_state(UserBookStates.waiting_hours)
     notice = ""
@@ -507,7 +508,7 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
     cap = min(int(data.get("immediate_max_hours", hi)), hi)
     if h < lo or h > cap:
         await message.answer(
-            f"Допустимо от {lo} до {cap} часов (сейчас до ближайшей занятости не больше {cap} ч.).",
+            f"Допустимо от {lo} до {cap} ч. (до ближайшей брони или аренды не больше {cap} ч.).",
             reply_markup=home_keyboard(),
         )
         return
@@ -579,17 +580,17 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
         if hours < lo or hours > cap:
             await session.rollback()
             await query.answer(
-                f"Недопустимый срок: от {lo} до {cap} ч. (окно до ближайшей занятости).",
+                f"Недопустимый срок: от {lo} до {cap} ч. (лимит до ближайшей брони или аренды).",
                 show_alert=True,
             )
             await state.clear()
             return
-        busy = await load_busy_intervals_utc(session, item_id)
+        rr = await load_rr_busy_intervals_utc(session, item_id)
         planned_end = now + timedelta(hours=hours)
-        if not reservation_fits(busy, now, planned_end):
+        if not reservation_fits(rr, now, planned_end):
             await session.rollback()
             await query.answer(
-                "Слот пересекается с бронью или окном недоступности — выберите меньше часов или позже.",
+                "Период пересекается с чужой бронью или арендой — выберите меньше часов или позже.",
                 show_alert=True,
             )
             await state.clear()
@@ -645,7 +646,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
             await state.clear()
             await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
             return
-        busy = await load_busy_intervals_utc(session, item_id)
+        rr = await load_rr_busy_intervals_utc(session, item_id)
         await session.commit()
     start_at = ensure_utc(datetime.fromisoformat(str(start_raw)))
     if start_at is None:
@@ -656,7 +657,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
         )
         return
     lo, hi = rent_lo_hi(item)
-    max_h = max_hours_from_start(start_at, busy, lo, hi)
+    max_h = max_hours_from_start(start_at, rr, lo, hi)
     if max_h < lo:
         await state.clear()
         await message.answer(
@@ -668,7 +669,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
     if h < lo or h > hi_eff:
         await message.answer(
             f"Укажите целое число часов от {lo} до {hi_eff} "
-            f"(до {_fmt_utc_local(max_reservation_end_utc(start_at, busy), settings)}).",
+            f"(до {_fmt_utc_local(max_reservation_end_utc(start_at, rr), settings)}).",
             reply_markup=home_keyboard(),
         )
         return

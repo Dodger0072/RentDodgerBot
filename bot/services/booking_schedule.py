@@ -49,7 +49,7 @@ def point_inside_busy(t: datetime, busy: list[tuple[datetime, datetime]]) -> boo
 
 
 async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
-    """Брони и активные аренды — без окон недоступности владельца."""
+    """Брони и аренды (active / pending_admin): вещь занята по расписанию. Окна «не у компа» (blackout) не включаются."""
     busy: list[tuple[datetime, datetime]] = []
 
     r_res = await session.execute(
@@ -88,7 +88,7 @@ async def load_blackout_intervals_utc(session: AsyncSession, item_id: int) -> li
 
 
 async def load_busy_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
-    """Резервации, активные аренды и blackout — занятые полуинтервалы [start, end)."""
+    """Объединение RR и blackout (календарь). Пересечение периода аренды проверяйте по RR отдельно."""
     rr = await load_rr_busy_intervals_utc(session, item_id)
     bo = await load_blackout_intervals_utc(session, item_id)
     return rr + bo
@@ -176,7 +176,7 @@ def max_reservation_end_utc(start: datetime, busy: list[tuple[datetime, datetime
 def max_hours_from_start(
     start: datetime, busy: list[tuple[datetime, datetime]], lo: int, hi: int
 ) -> int:
-    """Сколько полных часов можно взять: не больше hi и места до следующей брони."""
+    """Сколько полных часов можно взять: не больше hi и места до следующей «занятости вещи» (RR, без blackout)."""
     max_end = max_reservation_end_utc(start, busy)
     start_u = ensure_utc(start)
     if start_u is None:
@@ -205,7 +205,7 @@ def parse_booking_start_text(text: str, settings: Settings) -> datetime | None:
 def reservation_fits(
     busy: list[tuple[datetime, datetime]], start: datetime, end: datetime
 ) -> bool:
-    """Новый слот [start, end) не пересекается ни с одним занятым."""
+    """Новый слот [start, end) не пересекается ни с одним интервалом в списке (обычно только RR)."""
     s, e = normalize_interval_bounds(start, end)
     return not any(intervals_overlap(s, e, bs, be) for bs, be in busy)
 
@@ -239,23 +239,22 @@ async def validate_new_reservation(
     if r_pend.scalar_one_or_none() is not None:
         return "Есть ожидающая заявка у администратора — бронь временно недоступна."
 
-    busy = await load_busy_intervals_utc(session, item_id)
+    busy_rr = await load_rr_busy_intervals_utc(session, item_id)
     bo = await load_blackout_intervals_utc(session, item_id)
-    if point_inside_busy(s, busy):
+    # Blackout: нельзя начать выдачу в этот момент; пересечение [s,e) с blackout допустимо.
+    if point_inside_busy(s, bo):
         until = blackout_max_end_covering_point(s, bo)
         if until is not None:
             return user_msg_blocked_by_blackout_until(settings, until) + " Укажите другое время начала."
         return (
+            "В это время владелец не сможет выдать вещь (окно недоступности). "
+            "Укажите другое время начала."
+        )
+    if point_inside_busy(s, busy_rr):
+        return (
             "Это время уже занято другой бронью или текущей арендой. Укажите другое время начала."
         )
-    if not reservation_fits(busy, s, e):
-        until_slot = blackout_max_end_overlapping_slot(s, e, bo)
-        if until_slot is not None:
-            return (
-                f"{user_msg_blocked_by_blackout_until(settings, until_slot)} "
-                f"Период брони с этим началом и длительностью задевает это окно — "
-                f"выберите другое начало или срок."
-            )
+    if not reservation_fits(busy_rr, s, e):
         return (
             "Интервал пересекается с уже существующей бронью или арендой. "
             "Выберите другие время или длительность."
@@ -272,7 +271,7 @@ async def validate_new_reservation(
     lo, hi = rent_lo_hi(item)
     if h < lo or h > hi:
         return f"Длительность от {lo} до {hi} ч."
-    max_h = max_hours_from_start(s, busy, lo, hi)
+    max_h = max_hours_from_start(s, busy_rr, lo, hi)
     if h > max_h:
         return f"До следующей брони можно максимум {max_h} ч."
     return None
