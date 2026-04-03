@@ -4,6 +4,7 @@ from decimal import Decimal
 from html import escape
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
@@ -79,5 +80,39 @@ async def notify_admins_new_reservation(
     for admin_id in recipients:
         try:
             await bot.send_message(admin_id, text)
+        except Exception:
+            continue
+
+
+async def notify_admins_user_cancelled_reservation(
+    bot: Bot,
+    settings: Settings,
+    item: Item | None,
+    *,
+    reservation_id: int,
+    user_id: int,
+    username: str | None,
+    hours: int,
+    start_at,
+    end_at,
+) -> None:
+    """Пользователь сам снял бронь в допустимый срок."""
+    name = escape(item.name) if item else "?"
+    iid = item.id if item else "?"
+    uname = escape((username or "—").lstrip("@"))
+    text = (
+        "ℹ️ <b>Пользователь отменил бронь</b>\n"
+        f"Бронь id: <code>{reservation_id}</code>\n"
+        f"Вещь: {name} (id {iid})\n"
+        f"Пользователь: @{uname} ({user_id})\n"
+        f"Часов: {hours}\n"
+        f"Было: {format_local_time(start_at, settings)} — {format_local_time(end_at, settings)}"
+    )
+    recipients = item_notification_recipients(item, settings) if item is not None else []
+    if not recipients:
+        recipients = sorted(settings.admin_user_ids)
+    for admin_id in recipients:
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
         except Exception:
             continue

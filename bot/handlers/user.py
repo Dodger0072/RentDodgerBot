@@ -6,11 +6,18 @@ from html import escape
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InputMediaPhoto, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from bot.config import Settings
 from bot.time_format import format_local_time
@@ -28,7 +35,11 @@ from bot.keyboards.inline import (
     inventory_subcategory_keyboard,
     item_list_keyboard,
 )
-from bot.services.admin_notify import notify_admins_new_reservation, notify_admins_pending_rental
+from bot.services.admin_notify import (
+    notify_admins_new_reservation,
+    notify_admins_pending_rental,
+    notify_admins_user_cancelled_reservation,
+)
 from bot.services.booking_schedule import (
     explain_booking_start_conflict,
     load_busy_intervals_utc,
@@ -38,6 +49,8 @@ from bot.services.booking_schedule import (
     point_inside_busy,
     rent_lo_hi,
     validate_new_reservation,
+    MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START,
+    user_may_cancel_reservation,
 )
 from bot.services.rental import (
     can_take_immediate_rent,
@@ -55,6 +68,20 @@ from bot.services.user_discipline import booking_rules_block, near_ban_notice_fo
 from bot.states import UserBookStates, UserRentStates
 
 router = Router(name="user")
+
+
+def _my_reservations_keyboard(reservations: list[Reservation], *, now: datetime) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for res in reservations:
+        if user_may_cancel_reservation(now_utc=now, reservation_start_utc=res.start_at):
+            b.row(
+                InlineKeyboardButton(
+                    text=f"Отменить бронь #{res.id}",
+                    callback_data=f"u:cnlres:{res.id}",
+                )
+            )
+    b.row(InlineKeyboardButton(text="« Главное меню", callback_data="u:home"))
+    return b.as_markup()
 
 
 def _fmt_utc_local(dt: datetime, settings: Settings) -> str:
@@ -708,8 +735,108 @@ async def user_book_confirm(
     await state.clear()
     await query.message.edit_text(
         f"Бронь создана с {_fmt_utc_local(start_at, settings)} по {_fmt_utc_local(end_at, settings)}.\n\n"
-        f"<i>Свяжитесь с арендодателем вовремя — см. правила предупреждений выше.</i>",
+        f"<i>Свяжитесь с арендодателем вовремя — см. правила предупреждений выше.</i>\n\n"
+        f"/my_bookings — посмотреть или отменить бронь (не позднее чем за "
+        f"{MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала).",
         reply_markup=home_keyboard(),
         parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.message(Command("my_bookings"))
+async def cmd_my_bookings(message: Message, settings: Settings) -> None:
+    now = datetime.now(UTC)
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Reservation)
+            .options(selectinload(Reservation.item))
+            .where(
+                Reservation.user_id == message.from_user.id,
+                Reservation.end_at > now,
+            )
+            .order_by(Reservation.start_at.asc())
+        )
+        rows = list(r.scalars().unique())
+        await session.commit()
+    if not rows:
+        await message.answer(
+            "У вас нет активных броней на будущее.\n\n"
+            f"Свою бронь можно отменить самостоятельно не позднее чем за "
+            f"<b>{MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START}</b> ч до начала — команда /my_bookings.",
+            reply_markup=home_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = [
+        "<b>Ваши брони</b>\n",
+        f"<i>Снять бронь самому — не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.</i>\n",
+    ]
+    for res in rows:
+        it = res.item
+        name = escape(it.name if it else "?")
+        lines.append(
+            f"• #{res.id} <b>{name}</b>\n"
+            f"  {_fmt_utc_local(res.start_at, settings)} — {_fmt_utc_local(res.end_at, settings)} "
+            f"({res.requested_hours} ч)"
+        )
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=_my_reservations_keyboard(rows, now=now),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.regexp(r"^u:cnlres:(\d+)$"))
+async def user_cancel_reservation_cb(query: CallbackQuery, bot: Bot, settings: Settings) -> None:
+    rid = int(query.data.split(":")[2])
+    uid = query.from_user.id
+    now = datetime.now(UTC)
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Reservation)
+            .options(selectinload(Reservation.item))
+            .where(Reservation.id == rid)
+        )
+        res = r.scalar_one_or_none()
+        if res is None or res.user_id != uid:
+            await session.rollback()
+            await query.answer("Бронь не найдена", show_alert=True)
+            return
+        end_u = ensure_utc(res.end_at)
+        if end_u is not None and end_u <= now:
+            await session.rollback()
+            await query.answer("Бронь уже недоступна для отмены", show_alert=True)
+            return
+        if not user_may_cancel_reservation(now_utc=now, reservation_start_utc=res.start_at):
+            await session.rollback()
+            await query.answer(
+                f"Отмена возможна не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.",
+                show_alert=True,
+            )
+            return
+        item = res.item
+        res_id = res.id
+        hours = res.requested_hours
+        st_copy = res.start_at
+        en_copy = res.end_at
+        uname = res.username
+        await session.delete(res)
+        await session.commit()
+
+    await notify_admins_user_cancelled_reservation(
+        bot,
+        settings,
+        item,
+        reservation_id=res_id,
+        user_id=uid,
+        username=uname or query.from_user.username,
+        hours=hours,
+        start_at=st_copy,
+        end_at=en_copy,
+    )
+    await query.message.edit_text(
+        f"Бронь #{res_id} отменена.",
+        reply_markup=home_keyboard(),
     )
     await query.answer()

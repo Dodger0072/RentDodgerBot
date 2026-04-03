@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.config import Settings, is_admin
+from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.keyboards.inline import category_keyboard
 from bot.keyboards.reply import start_reply_keyboard
 
@@ -33,6 +34,7 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
         parse_mode=ParseMode.HTML,
     )
     await message.answer(
+        f"/my_bookings — список ваших броней и отмена (не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала слота).\n\n"
         "Кнопка «Начать» внизу экрана — то же, что /start (сброс шагов и этот каталог).",
         reply_markup=start_reply_keyboard(),
     )

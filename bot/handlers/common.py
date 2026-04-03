@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.config import Settings, is_admin
+from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.keyboards.inline import home_keyboard
 from bot.keyboards.reply import start_reply_keyboard
 from bot.main_menu import send_main_menu
@@ -49,7 +50,8 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
         await message.answer(_ADMIN_HELP, reply_markup=home_keyboard(), parse_mode=ParseMode.HTML)
     else:
         await message.answer(
-            "Доступные действия: /start или кнопка «Начать», затем выберите каталог аренды.",
+            "Доступные действия: /start или кнопка «Начать», затем каталог аренды. "
+            f"/my_bookings — ваши брони; отмена не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.",
             reply_markup=home_keyboard(),
         )
     await message.answer(
