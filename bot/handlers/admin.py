@@ -48,6 +48,7 @@ from bot.services.user_bans import (
     list_bans,
     normalize_username,
     remove_ban_by_username,
+    resolve_user_id_by_username_norm,
 )
 from bot.services.user_discipline import (
     WARNINGS_BAN_THRESHOLD,
@@ -616,6 +617,8 @@ async def cmd_ban_user(message: Message, bot: Bot, settings: Settings) -> None:
         pass
 
     async with db_session.async_session_maker() as session:
+        if resolved_id is None:
+            resolved_id = await resolve_user_id_by_username_norm(session, uname)
         r = await session.execute(select(UserBan).where(UserBan.username_norm == uname))
         if r.scalar_one_or_none() is not None:
             await session.rollback()
@@ -641,7 +644,7 @@ async def cmd_ban_user(message: Message, bot: Bot, settings: Settings) -> None:
     hint = ""
     if resolved_id is None:
         hint = (
-            "\n\n<i>User_id не удалось определить (нет чата с пользователем или неверный username) — "
+            "\n\n<i>User_id не найден ни через Telegram, ни в базе бота — "
             "блокировка только по @username при следующем обращении с этим ником.</i>"
         )
     await message.answer(
@@ -734,8 +737,18 @@ async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
                 user_id = int(chat.id)
             username_for_row = chat.username or uname
         except TelegramBadRequest:
-            await message.answer("Не удалось найти пользователя. Проверьте username.")
-            return
+            async with db_session.async_session_maker() as session:
+                user_id = await resolve_user_id_by_username_norm(session, uname)
+            if user_id is None:
+                await message.answer(
+                    "Telegram не отдаёт профиль по @username (для обычных пользователей так бывает), "
+                    "и в базе бота не найдено заявок/броней с этим ником.\n\n"
+                    "Укажите числовой <b>id</b> пользователя (Настройки Telegram) "
+                    "или попросите его снова написать боту.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            username_for_row = uname
 
     if user_id is None:
         await message.answer("Не удалось определить пользователя.")
