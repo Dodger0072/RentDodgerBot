@@ -46,6 +46,26 @@ async def _migrate_sqlite_item_owner(conn) -> None:
         await conn.execute(text("ALTER TABLE items ADD COLUMN owner_username VARCHAR(255)"))
 
 
+async def _migrate_sqlite_item_category(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(items)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "item_category" not in cols:
+        await conn.execute(text("ALTER TABLE items ADD COLUMN item_category VARCHAR(64)"))
+
+
+async def _migrate_sqlite_item_display_order(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(items)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "display_order" not in cols:
+        await conn.execute(
+            text("ALTER TABLE items ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0")
+        )
+
+
 async def init_db() -> None:
     if engine is None:
         raise RuntimeError("Engine not configured")
@@ -53,3 +73,5 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_sqlite_reservation_columns(conn)
         await _migrate_sqlite_item_owner(conn)
+        await _migrate_sqlite_item_category(conn)
+        await _migrate_sqlite_item_display_order(conn)

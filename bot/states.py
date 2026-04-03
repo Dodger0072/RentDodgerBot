@@ -4,6 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 class AddItemStates(StatesGroup):
     name = State()
     description = State()
+    category = State()
     photos = State()
     is_paid = State()
     price_hour = State()

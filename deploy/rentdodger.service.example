@@ -1,0 +1,27 @@
+# Пример для systemd (Ubuntu). Скопируйте в /etc/systemd/system/rentdodger.service
+# и поправьте пути, если проект не в /opt/RentDodgerBot.
+#
+# Переменные берутся из .env через python-dotenv при старте (см. WorkingDirectory).
+# EnvironmentFile= для .env НЕ использовать: systemd хуже парсит формат, чем Python.
+#
+# После правок:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now rentdodger.service
+#   journalctl -u rentdodger.service -f
+
+[Unit]
+Description=Rent Dodger Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/RentDodgerBot
+ExecStart=/opt/RentDodgerBot/.venv/bin/python3 -m bot.main
+Restart=always
+RestartSec=5
+# Не ставьте User=/Group= с несуществующим или шаблонным именем — будет status=217/USER.
+# Либо уберите эти строки (как здесь), либо укажите реальный логин из /etc/passwd и выставьте права на /opt/RentDodgerBot.
+
+[Install]
+WantedBy=multi-user.target

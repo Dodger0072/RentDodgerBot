@@ -8,7 +8,7 @@ from html import escape
 from aiogram import Bot, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -16,13 +16,19 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.config import Settings, is_admin, is_superadmin
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation, UserBan
 from bot.db import session as db_session
-from bot.keyboards.inline import admin_hours_keyboard, admin_rental_decision_keyboard
+from bot.keyboards.inline import (
+    admin_hours_keyboard,
+    admin_item_category_keyboard,
+    admin_rental_decision_keyboard,
+)
+from bot.item_categories import ITEM_CATEGORY_SLUGS, item_category_label
 from bot.services.booking_schedule import parse_booking_start_text
 from bot.services.item_blackout import (
     add_item_blackout_record,
     cancel_pending_rentals_hit_by_blackout,
     cancel_reservations_hit_by_blackout,
 )
+from bot.services.item_order import next_display_order_for_group, reorder_item_to_position
 from bot.services.item_owner import (
     admin_can_delete_item,
     admin_manages_item,
@@ -104,10 +110,33 @@ async def add_item_description(message: Message, state: FSMContext, settings: Se
         await state.clear()
         return
     await state.update_data(description=message.text.strip(), photos=[])
-    await state.set_state(AddItemStates.photos)
+    await state.set_state(AddItemStates.category)
     await message.answer(
-        "Пришлите фото (можно несколько сообщений). Когда закончите — напишите /done или отправьте команду без фото.",
+        "Выберите <b>категорию</b> вещи:",
+        reply_markup=admin_item_category_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
+
+
+@router.callback_query(StateFilter(AddItemStates.category), F.data.startswith("adm:addcat:"))
+async def add_item_category_cb(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        await state.clear()
+        return
+    parts = (query.data or "").split(":")
+    slug = parts[2] if len(parts) > 2 else ""
+    if slug not in ITEM_CATEGORY_SLUGS:
+        await query.answer("Неизвестная категория", show_alert=True)
+        return
+    await state.update_data(item_category=slug)
+    await state.set_state(AddItemStates.photos)
+    await query.message.edit_text(
+        f"Категория: <b>{item_category_label(slug)}</b>.\n\n"
+        "Пришлите фото (можно несколько сообщений). Когда закончите — напишите /done.",
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
 
 
 @router.message(AddItemStates.photos, Command("done"))
@@ -142,6 +171,9 @@ async def add_item_is_paid(message: Message, state: FSMContext, settings: Settin
         await state.update_data(is_paid=False)
         async with db_session.async_session_maker() as session:
             data = await state.get_data()
+            ord_val = await next_display_order_for_group(
+                session, is_paid=False, item_category=data.get("item_category")
+            )
             item = Item(
                 name=data["name"],
                 description=data["description"],
@@ -150,6 +182,8 @@ async def add_item_is_paid(message: Message, state: FSMContext, settings: Settin
                 price_hour=None,
                 price_day=None,
                 price_week=None,
+                item_category=data.get("item_category"),
+                display_order=ord_val,
                 owner_user_id=message.from_user.id,
                 owner_username=message.from_user.username,
             )
@@ -208,6 +242,9 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
         return
     data = await state.get_data()
     async with db_session.async_session_maker() as session:
+        ord_val = await next_display_order_for_group(
+            session, is_paid=True, item_category=data.get("item_category")
+        )
         item = Item(
             name=data["name"],
             description=data["description"],
@@ -216,6 +253,8 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
             price_hour=Decimal(data["price_hour"]),
             price_day=Decimal(data["price_day"]),
             price_week=v,
+            item_category=data.get("item_category"),
+            display_order=ord_val,
             owner_user_id=message.from_user.id,
             owner_username=message.from_user.username,
         )
@@ -234,7 +273,7 @@ async def cmd_list_items(message: Message, settings: Settings) -> None:
         r = await session.execute(
             select(Item)
             .where(or_(Item.owner_user_id.is_(None), Item.owner_user_id == uid))
-            .order_by(Item.id)
+            .order_by(Item.display_order.asc(), Item.id.asc())
         )
         items = list(r.scalars())
     if not items:
@@ -253,7 +292,8 @@ async def cmd_list_items(message: Message, settings: Settings) -> None:
                 own += " (удалить: только суперадмин)"
         elif it.owner_user_id == uid:
             own = " | ваша"
-        lines.append(f"{it.id}. {it.name} ({cat}{own})")
+        ic = item_category_label(it.item_category)
+        lines.append(f"{it.id}. {it.name} ({cat} | {ic}{own})")
     await message.answer("Ваши и общие вещи:\n" + "\n".join(lines))
 
 
@@ -291,6 +331,44 @@ async def cmd_delete_item(message: Message, settings: Settings) -> None:
         await session.delete(item)
         await session.commit()
     await message.answer(f"Вещь {iid} удалена.")
+
+
+@router.message(Command("item_order"))
+async def cmd_item_order(message: Message, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    tokens = (message.text or "").strip().split()
+    if len(tokens) < 3:
+        await message.answer(
+            "Использование: <code>/item_order id позиция</code>\n\n"
+            "<b>id</b> — из <code>/list_items</code>.\n"
+            "<b>позиция</b> — место в списке у пользователя внутри той же группы "
+            "(платная/бесплатная и одна категория): <code>1</code> = сверху.\n\n"
+            "Пример: <code>/item_order 5 1</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        iid = int(tokens[1])
+        pos = int(tokens[2])
+    except ValueError:
+        await message.answer("id и позиция должны быть целыми числами.")
+        return
+    if pos < 1:
+        await message.answer("Позиция должна быть не меньше 1.")
+        return
+    async with db_session.async_session_maker() as session:
+        ok, text = await reorder_item_to_position(
+            session,
+            item_id=iid,
+            position_1based=pos,
+            acting_user_id=message.from_user.id,
+        )
+        if ok:
+            await session.commit()
+        else:
+            await session.rollback()
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("ban_user", "ban"))

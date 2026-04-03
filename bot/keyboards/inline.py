@@ -3,6 +3,31 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.item_categories import ITEM_CATEGORIES, UNCATEGORIZED_SLUG
+
+
+def admin_item_category_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for slug, label in ITEM_CATEGORIES:
+        b.row(InlineKeyboardButton(text=label, callback_data=f"adm:addcat:{slug}"))
+    return b.as_markup()
+
+
+def inventory_subcategory_keyboard(*, is_paid: bool) -> InlineKeyboardMarkup:
+    """Второй уровень: тип аренды уже выбран (платная/бесплатная)."""
+    kind = "paid" if is_paid else "free"
+    b = InlineKeyboardBuilder()
+    for slug, label in ITEM_CATEGORIES:
+        b.row(InlineKeyboardButton(text=label, callback_data=f"u:grp:{kind}:{slug}"))
+    b.row(
+        InlineKeyboardButton(
+            text="Без категории",
+            callback_data=f"u:grp:{kind}:{UNCATEGORIZED_SLUG}",
+        )
+    )
+    b.row(InlineKeyboardButton(text="« Назад", callback_data="u:back"))
+    return b.as_markup()
+
 
 def category_keyboard() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()

@@ -7,15 +7,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.config import Settings, is_admin
-from bot.keyboards.inline import category_keyboard, home_keyboard
+from bot.keyboards.inline import home_keyboard
+from bot.keyboards.reply import start_reply_keyboard
+from bot.main_menu import send_main_menu
 
 router = Router(name="common")
 
 _ADMIN_HELP = """<b>Команды администратора</b>
 
 <b>Вещи</b>
-• /add_item — добавить вещь (она закрепляется за вами как за владельцем)
+• /add_item — добавить вещь (категория, фото, платная/бесплатная); закрепляется за вами
 • /list_items — ваши вещи и «общие» без владельца (старая база)
+• /item_order &lt;id&gt; &lt;позиция&gt; — порядок в каталоге у пользователя внутри группы (платность+категория), 1 = выше всех
 • /delete_item &lt;id&gt; — удалить свою вещь; общие legacy — только суперадмин (SUPERADMIN_USER_IDS)
 
 <b>Заявки и брони</b>
@@ -32,7 +35,7 @@ _ADMIN_HELP = """<b>Команды администратора</b>
 • /list_bans — кто в бане
 
 <b>Прочее</b>
-• /start — сбросить шаги и открыть меню
+• /start или кнопка «Начать» — сбросить шаги и открыть меню
 • /help — это сообщение
 """
 
@@ -42,24 +45,17 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
     await state.clear()
     if is_admin(message.from_user.id, message.from_user.username, settings):
         await message.answer(_ADMIN_HELP, reply_markup=home_keyboard(), parse_mode=ParseMode.HTML)
-        return
+    else:
+        await message.answer(
+            "Доступные действия: /start или кнопка «Начать», затем выберите каталог аренды.",
+            reply_markup=home_keyboard(),
+        )
     await message.answer(
-        "Доступные действия: нажмите /start и выберите каталог аренды.",
-        reply_markup=home_keyboard(),
+        "Быстрый возврат в каталог — кнопка «Начать» под полем ввода.",
+        reply_markup=start_reply_keyboard(),
     )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, settings: Settings) -> None:
-    await state.clear()
-    extra = ""
-    if is_admin(message.from_user.id, message.from_user.username, settings):
-        extra = (
-            "\n\nАдмин: /add_item — добавить вещь, /list_items, /delete_item (id); "
-            "/bookings, /add_blackout; /list_blackouts, /delete_blackout id; /delete_item — свои вещи (общие — суперадмин); "
-            "/ban @name [причина], /unban @name, /list_bans."
-        )
-    await message.answer(
-        "Привет! Выберите каталог аренды:" + extra,
-        reply_markup=category_keyboard(),
-    )
+    await send_main_menu(message, state, settings)

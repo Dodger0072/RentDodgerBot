@@ -9,17 +9,23 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InputMediaPhoto, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.time_format import format_local_time
 from bot.db.models import Item, Rental, RentalState, Reservation
 from bot.db import session as db_session
+from bot.item_categories import (
+    ITEM_CATEGORY_SLUGS,
+    UNCATEGORIZED_SLUG,
+    item_category_label,
+)
 from bot.keyboards.inline import (
     category_keyboard,
     confirm_keyboard,
     home_keyboard,
+    inventory_subcategory_keyboard,
     item_list_keyboard,
 )
 from bot.services.admin_notify import notify_admins_new_reservation, notify_admins_pending_rental
@@ -55,7 +61,11 @@ def _fmt_utc_local(dt: datetime, settings: Settings) -> str:
 
 
 def _item_caption(item: Item, settings: Settings, extra: str = "") -> str:
-    lines = [f"<b>{escape(item.name)}</b>\n", escape(item.description)]
+    lines = [
+        f"<b>{escape(item.name)}</b>\n",
+        f"<i>{escape(item_category_label(item.item_category))}</i>\n",
+        escape(item.description),
+    ]
     if item.is_paid and item.price_hour is not None:
         lines.append(
             f"\nЦена: {format_money(item.price_hour)} / час, "
@@ -87,21 +97,16 @@ async def _send_item_visual(target: Message, item: Item, caption: str, reply_mar
 async def cat_paid(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     await state.clear()
     async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item).where(Item.is_paid.is_(True)).order_by(Item.id))
-        rows = list(r.scalars().all())
-        ids = [it.id for it in rows]
-        ref_now, status_map = await items_availability_batch(session, ids)
-        items = [
-            (it.id, item_list_button_text(it.name, status_map[it.id], ref_now=ref_now))
-            for it in rows
-        ]
+        r = await session.execute(select(Item.id).where(Item.is_paid.is_(True)).limit(1))
+        if r.scalar_one_or_none() is None:
+            await session.commit()
+            await query.answer("Пока нет вещей в платной аренде", show_alert=True)
+            return
         await session.commit()
-    if not items:
-        await query.answer("Пока нет вещей в этой категории", show_alert=True)
-        return
     await query.message.answer(
-        "Платная аренда — выберите вещь:",
-        reply_markup=item_list_keyboard(items, "u"),
+        "Платная аренда — выберите <b>категорию вещей</b>:",
+        reply_markup=inventory_subcategory_keyboard(is_paid=True),
+        parse_mode=ParseMode.HTML,
     )
     await query.answer()
 
@@ -110,7 +115,43 @@ async def cat_paid(query: CallbackQuery, state: FSMContext, settings: Settings) 
 async def cat_free(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     await state.clear()
     async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item).where(Item.is_paid.is_(False)).order_by(Item.id))
+        r = await session.execute(select(Item.id).where(Item.is_paid.is_(False)).limit(1))
+        if r.scalar_one_or_none() is None:
+            await session.commit()
+            await query.answer("Пока нет вещей в бесплатной аренде", show_alert=True)
+            return
+        await session.commit()
+    await query.message.answer(
+        "Бесплатная аренда — выберите <b>категорию вещей</b>:",
+        reply_markup=inventory_subcategory_keyboard(is_paid=False),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("u:grp:"))
+async def cat_then_inventory_group(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    parts = (query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "u" or parts[1] != "grp":
+        await query.answer()
+        return
+    kind, slug = parts[2], parts[3]
+    if kind not in ("paid", "free"):
+        await query.answer()
+        return
+    is_paid = kind == "paid"
+    if slug != UNCATEGORIZED_SLUG and slug not in ITEM_CATEGORY_SLUGS:
+        await query.answer("Неизвестная категория", show_alert=True)
+        return
+    async with db_session.async_session_maker() as session:
+        q = select(Item).where(Item.is_paid.is_(is_paid))
+        if slug == UNCATEGORIZED_SLUG:
+            q = q.where(or_(Item.item_category.is_(None), Item.item_category == ""))
+        else:
+            q = q.where(Item.item_category == slug)
+        q = q.order_by(Item.display_order.asc(), Item.id.asc())
+        r = await session.execute(q)
         rows = list(r.scalars().all())
         ids = [it.id for it in rows]
         ref_now, status_map = await items_availability_batch(session, ids)
@@ -120,10 +161,15 @@ async def cat_free(query: CallbackQuery, state: FSMContext, settings: Settings) 
         ]
         await session.commit()
     if not items:
-        await query.answer("Пока нет вещей в этой категории", show_alert=True)
+        await query.answer("В этой категории пока нет вещей", show_alert=True)
         return
+    kind_ru = "Платная" if is_paid else "Бесплатная"
+    if slug == UNCATEGORIZED_SLUG:
+        title = f"{kind_ru} аренда — без категории"
+    else:
+        title = f"{kind_ru} аренда — {item_category_label(slug)}"
     await query.message.answer(
-        "Бесплатная аренда — выберите вещь:",
+        f"{title}. Выберите вещь:",
         reply_markup=item_list_keyboard(items, "u"),
     )
     await query.answer()

@@ -13,7 +13,7 @@ from bot.config import load_settings
 from bot.telegram_session import build_telegram_session
 from bot.db.session import init_db, setup_engine
 from bot.handlers import admin, common, user
-from bot.middlewares import BanMiddleware, SettingsMiddleware
+from bot.middlewares import BanMiddleware, SettingsMiddleware, StartReplyButtonMiddleware
 from bot.services.reservation_reminders import reservation_reminder_loop
 
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +38,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(SettingsMiddleware(settings))
     dp.update.middleware(BanMiddleware())
+    dp.message.middleware(StartReplyButtonMiddleware())
 
     dp.include_router(common.router)
     dp.include_router(admin.router)
