@@ -42,6 +42,7 @@ from bot.services.rental import (
     price_for_hours,
     rent_hours_bounds,
 )
+from bot.services.rental_stats import fetch_rental_stats, record_handover_stat
 from bot.services.user_bans import (
     add_ban,
     is_user_banned,
@@ -104,6 +105,7 @@ async def _finalize_rental_handover(
         total = price_for_hours(item, req_hours)
     except ValueError:
         total = Decimal("0")
+    record_handover_stat(session, item_id=rental.item_id, amount=total, handed_over_at=now)
     await record_successful_handover(session, rental.user_id, rental.username)
     await session.commit()
     end_label = format_local_time(end, settings)
@@ -1105,6 +1107,25 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
         if len(text) > 4000:
             text = text[:3990] + "…"
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("rent_stats"))
+async def cmd_rent_stats(message: Message, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    async with db_session.async_session_maker() as session:
+        snap = await fetch_rental_stats(session, settings)
+        await session.commit()
+    tz_hint = escape(settings.time_zone_label.strip() or "локальному времени бота")
+    text = (
+        f"<b>Статистика аренды</b> <i>(сегодня / неделя / месяц — границы по {tz_hint})</i>\n\n"
+        f"Заработано с аренды всего: {format_money(snap.earned_total)}\n"
+        f"За сегодня: {format_money(snap.earned_today)}\n"
+        f"За неделю: {format_money(snap.earned_week)}\n"
+        f"За месяц: {format_money(snap.earned_month)}\n\n"
+        f"Сдано аксессуаров всего: {snap.handovers_total}"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data == "adm:res:abort")

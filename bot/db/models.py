@@ -86,6 +86,20 @@ class ItemBlackout(Base):
     item: Mapped["Item"] = relationship(back_populates="blackouts")
 
 
+class RentalHandoverStat(Base):
+    """Факт выдачи вещи в аренду (админ подтвердил часы). Нужен для статистики: аренды потом удаляются по истечении срока."""
+
+    __tablename__ = "rental_handover_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    handed_over_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Rental(Base):
     __tablename__ = "rentals"
 
