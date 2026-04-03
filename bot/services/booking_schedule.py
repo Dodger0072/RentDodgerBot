@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
@@ -63,7 +63,7 @@ async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> lis
     r_rent = await session.execute(
         select(Rental).where(
             Rental.item_id == item_id,
-            Rental.state.in_(
+            func.coalesce(func.trim(Rental.state), "").in_(
                 (RentalState.active.value, RentalState.pending_admin.value)
             ),
         )
@@ -233,7 +233,7 @@ async def validate_new_reservation(
     r_pend = await session.execute(
         select(Rental.id).where(
             Rental.item_id == item_id,
-            Rental.state == RentalState.pending_admin.value,
+            func.coalesce(func.trim(Rental.state), "") == RentalState.pending_admin.value,
         )
     )
     if r_pend.scalar_one_or_none() is not None:

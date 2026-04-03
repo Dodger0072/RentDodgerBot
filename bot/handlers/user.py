@@ -233,10 +233,15 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
             "\n\n⏳ <b>Статус:</b> заявка на рассмотрении у администратора — "
             "аренда и бронь временно недоступны."
         )
-    elif st.active_rental is not None and st.active_rental.end_at:
+    elif st.active_rental is not None:
+        until_s = (
+            _fmt_utc_local(st.active_rental.end_at, settings)
+            if st.active_rental.end_at is not None
+            else "—"
+        )
         extra = (
             f"\n\n🔒 <b>Статус:</b> занята до "
-            f"<b>{_fmt_utc_local(st.active_rental.end_at, settings)}</b> — бронь можно "
+            f"<b>{until_s}</b> — бронь можно "
             "оформить на время после освобождения (укажите дату и начало в форме брони)."
         )
         b.row(
@@ -281,11 +286,18 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         b.row(InlineKeyboardButton(text="Взять в аренду", callback_data=f"take:{item_id}"))
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
     else:
+        hint_next = ""
+        if st.next_busy_after is not None:
+            hint_next = (
+                f"\n\nБлижайшее начало занятости по данным бота: "
+                f"<b>{_fmt_utc_local(st.next_busy_after, settings)}</b> "
+                f"(если это не та бронь, что в списке — ищите ещё слот, блэкаут или заявку)."
+            )
         extra = (
             f"\n\n📅 <b>Статус:</b> сейчас нельзя взять сразу: минимальный срок для этой вещи "
             f"<b>{st.min_rent_hours}</b> ч., а без пересечений с бронями, заявками и недоступностью "
-            f"укладывается не более <b>{st.immediate_rent_max_hours}</b> ч. "
-            f"Нажмите «Забронировать», чтобы выбрать время в свободном слоте."
+            f"укладывается не более <b>{st.immediate_rent_max_hours}</b> ч.{hint_next}"
+            f"\n\nНажмите «Забронировать», чтобы выбрать время в свободном слоте."
         )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
 

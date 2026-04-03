@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
@@ -17,11 +19,34 @@ MIN_RENT_HOURS_FREE = 1
 MIN_RENT_HOURS_PAID = 3
 
 
+def _rental_state_norm(state: str | None) -> str:
+    return (state or "").strip()
+
+
+def _busy_intervals_still_relevant(
+    ref_now: datetime, busy: list[tuple[datetime, datetime]]
+) -> list[tuple[datetime, datetime]]:
+    """Интервалы с концом строго после ref_now (полностью прошедшие не мешают расчёту «сейчас»)."""
+    now_u = ensure_utc(ref_now) or datetime.now(UTC)
+    out: list[tuple[datetime, datetime]] = []
+    for s, e in busy:
+        ee = ensure_utc(e)
+        if ee is not None and ee > now_u:
+            out.append((s, e))
+    return out
+
+
 def ensure_utc(dt: datetime | None) -> datetime | None:
-    """SQLite часто отдаёт naive datetime — приводим к UTC для сравнений."""
+    """Naive datetime из SQLite считаем UTC; при NAIVE_DATETIME_TZ — сначала как локальное время в этом поясе."""
     if dt is None:
         return None
     if dt.tzinfo is None:
+        tz_name = os.environ.get("NAIVE_DATETIME_TZ", "").strip()
+        if tz_name:
+            try:
+                return dt.replace(tzinfo=ZoneInfo(tz_name)).astimezone(UTC)
+            except Exception:
+                pass
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
 
@@ -80,6 +105,8 @@ class ItemStatus:
     immediate_rent_max_hours: int
     in_reserved_slot: bool
     reserved_until: datetime | None
+    # Мин. время начала занятости со start > now (для подсказки).
+    next_busy_after: datetime | None
     in_blackout: bool
     blackout_until: datetime | None = None
 
@@ -198,7 +225,7 @@ async def items_availability_batch(
     for row in r_bo.scalars():
         bo_by[row.item_id].append(row)
 
-    from bot.services.booking_schedule import load_busy_intervals_utc
+    from bot.services.booking_schedule import load_busy_intervals_utc, next_busy_start_after
 
     r_items = await session.execute(select(Item).where(Item.id.in_(item_ids)))
     items_map: dict[int, Item] = {it.id: it for it in r_items.scalars().all()}
@@ -207,10 +234,12 @@ async def items_availability_batch(
         item = items_map[iid]
         rentals = rentals_by.get(iid, [])
         reservations = res_by.get(iid, [])
-        pending = any(r.state == RentalState.pending_admin.value for r in rentals)
+        pending = any(
+            _rental_state_norm(r.state) == RentalState.pending_admin.value for r in rentals
+        )
         active = None
         for r in rentals:
-            if r.state != RentalState.active.value:
+            if _rental_state_norm(r.state) != RentalState.active.value:
                 continue
             end_at = ensure_utc(r.end_at)
             if end_at is None or end_at <= ref_now:
@@ -226,11 +255,13 @@ async def items_availability_batch(
         in_bo = bu is not None
 
         busy = await load_busy_intervals_utc(session, iid)
+        busy_eff = _busy_intervals_still_relevant(ref_now, busy)
+        nxt_after = next_busy_start_after(ref_now, busy_eff) if busy_eff else None
         lo, hi = rent_hours_bounds(item)
         if pending or in_bo or active is not None or in_rs:
             imm = 0
         else:
-            imm = _compute_immediate_rent_cap_hours(ref_now, busy, lo, hi)
+            imm = _compute_immediate_rent_cap_hours(ref_now, busy_eff, lo, hi)
 
         nxt = next_booking_start_utc(ref_now, active, reservations)
         out[iid] = ItemStatus(
@@ -241,6 +272,7 @@ async def items_availability_batch(
             immediate_rent_max_hours=imm,
             in_reserved_slot=in_rs,
             reserved_until=res_end,
+            next_busy_after=nxt_after,
             in_blackout=in_bo,
             blackout_until=bu,
         )
@@ -251,7 +283,7 @@ async def expire_expired_rentals(session: AsyncSession, now: datetime | None = N
     now = ensure_utc(now) or datetime.now(UTC)
     q = await session.execute(
         select(Rental).where(
-            Rental.state == RentalState.active.value,
+            func.coalesce(func.trim(Rental.state), "") == RentalState.active.value,
             Rental.end_at.is_not(None),
         )
     )
@@ -304,7 +336,7 @@ def next_booking_start_utc(
 
 
 async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus | None:
-    from bot.services.booking_schedule import load_busy_intervals_utc
+    from bot.services.booking_schedule import load_busy_intervals_utc, next_busy_start_after
 
     await expire_expired_rentals(session)
     item, rentals, reservations = await _load_item_rentals_reservations(session, item_id)
@@ -312,10 +344,12 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
         return None
 
     now = datetime.now(UTC)
-    pending = any(r.state == RentalState.pending_admin.value for r in rentals)
+    pending = any(
+        _rental_state_norm(r.state) == RentalState.pending_admin.value for r in rentals
+    )
     active = None
     for r in rentals:
-        if r.state != RentalState.active.value:
+        if _rental_state_norm(r.state) != RentalState.active.value:
             continue
         end_at = ensure_utc(r.end_at)
         if end_at is None or end_at <= now:
@@ -333,11 +367,13 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
     res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
 
     busy = await load_busy_intervals_utc(session, item_id)
+    busy_eff = _busy_intervals_still_relevant(now, busy)
+    nxt_after = next_busy_start_after(now, busy_eff) if busy_eff else None
     lo, hi = rent_hours_bounds(item)
     if pending or in_bo or active is not None or in_rs:
         imm = 0
     else:
-        imm = _compute_immediate_rent_cap_hours(now, busy, lo, hi)
+        imm = _compute_immediate_rent_cap_hours(now, busy_eff, lo, hi)
 
     nxt = next_booking_start_utc(now, active, reservations)
     return ItemStatus(
@@ -348,6 +384,7 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
         immediate_rent_max_hours=imm,
         in_reserved_slot=in_rs,
         reserved_until=res_end,
+        next_busy_after=nxt_after,
         in_blackout=in_bo,
         blackout_until=bu,
     )
