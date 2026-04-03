@@ -9,7 +9,7 @@ from bot.db import session as db_session
 from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.services.user_bot_state import mark_main_menu_seen, user_main_menu_seen
 from bot.keyboards.inline import category_keyboard
-from bot.keyboards.reply import remove_reply_keyboard, start_reply_keyboard
+from bot.keyboards.reply import remove_reply_keyboard
 
 _RENTAL_TYPES_INFO = (
     "<b>Платная аренда</b> — аренда за деньги. Доступна всем на срок от 3 до 168 часов.\n\n"
@@ -21,7 +21,7 @@ _RENTAL_TYPES_INFO = (
 
 
 async def send_main_menu(message: Message, state: FSMContext, settings: Settings) -> None:
-    """Сброс FSM и главный экран. Reply-кнопка «Начать» только до первого показа меню."""
+    """Сброс FSM и главный экран. Reply «Начать» сюда не вешаем — только снимаем, чтобы не залипала под полем ввода."""
     await state.clear()
     uid = message.from_user.id
     async with db_session.async_session_maker() as session:
@@ -42,16 +42,9 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
     )
     footer = (
         f"/my_bookings — список ваших броней и отмена (не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала слота).\n\n"
+        "Вернуться в этот каталог: команда /start."
     )
-    if first_menu:
-        footer += (
-            "Кнопка «Начать» внизу экрана — то же, что /start (сброс шагов и этот каталог)."
-        )
-        reply_bottom = start_reply_keyboard()
-    else:
-        footer += "Вернуться в этот каталог позже: команда /start."
-        reply_bottom = remove_reply_keyboard()
-    await message.answer(footer, reply_markup=reply_bottom)
+    await message.answer(footer, reply_markup=remove_reply_keyboard())
 
     if first_menu:
         async with db_session.async_session_maker() as session:
