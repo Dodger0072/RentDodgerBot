@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 
 def start_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -9,3 +9,7 @@ def start_reply_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="Начать")]],
         resize_keyboard=True,
     )
+
+
+def remove_reply_keyboard() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()

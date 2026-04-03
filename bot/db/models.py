@@ -13,6 +13,15 @@ class Base(DeclarativeBase):
     pass
 
 
+class UserBotState(Base):
+    """Служебное состояние пользователя в боте (онбординг)."""
+
+    __tablename__ = "user_bot_state"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    main_menu_seen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
 class UserRentalDiscipline(Base):
     """Предупреждения арендатора: 3 → бан; успешные выдачи обнуляют счётчик предупреждений."""
 

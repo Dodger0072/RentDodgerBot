@@ -6,6 +6,7 @@ from bot.db.models import (
     RentalState,
     Reservation,
     UserBan,
+    UserBotState,
     UserRentalDiscipline,
 )
 from bot.db.session import async_session_maker, engine, init_db, setup_engine
@@ -18,6 +19,7 @@ __all__ = [
     "RentalState",
     "Reservation",
     "UserBan",
+    "UserBotState",
     "UserRentalDiscipline",
     "async_session_maker",
     "engine",

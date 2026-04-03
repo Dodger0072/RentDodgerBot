@@ -2,17 +2,32 @@ from __future__ import annotations
 
 from aiogram import Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.config import Settings, is_admin
+from bot.db import session as db_session
 from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
+from bot.services.user_bot_state import user_main_menu_seen
 from bot.keyboards.inline import home_keyboard
-from bot.keyboards.reply import start_reply_keyboard
+from bot.keyboards.reply import remove_reply_keyboard, start_reply_keyboard
 from bot.main_menu import send_main_menu
 
 router = Router(name="common")
+
+
+class ReplyKeyboardStartFilter(BaseFilter):
+    """Текст с кнопки «Начать» (reply keyboard), регистр не важен."""
+
+    async def __call__(self, message: Message) -> bool:
+        return (message.text or "").strip().casefold() == "начать"
+
+
+@router.message(ReplyKeyboardStartFilter())
+async def cmd_start_reply_button(message: Message, state: FSMContext, settings: Settings) -> None:
+    await send_main_menu(message, state, settings)
+
 
 _ADMIN_HELP = """<b>Команды администратора</b>
 
@@ -46,6 +61,9 @@ _ADMIN_HELP = """<b>Команды администратора</b>
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> None:
     await state.clear()
+    async with db_session.async_session_maker() as session:
+        menu_seen = await user_main_menu_seen(session, message.from_user.id)
+        await session.commit()
     if is_admin(message.from_user.id, message.from_user.username, settings):
         await message.answer(_ADMIN_HELP, reply_markup=home_keyboard(), parse_mode=ParseMode.HTML)
     else:
@@ -54,10 +72,16 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
             f"/my_bookings — ваши брони; отмена не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.",
             reply_markup=home_keyboard(),
         )
-    await message.answer(
-        "Быстрый возврат в каталог — кнопка «Начать» под полем ввода.",
-        reply_markup=start_reply_keyboard(),
-    )
+    if menu_seen:
+        await message.answer(
+            "Вернуться в каталог: /start.",
+            reply_markup=remove_reply_keyboard(),
+        )
+    else:
+        await message.answer(
+            "Быстрый возврат в каталог — кнопка «Начать» под полем ввода.",
+            reply_markup=start_reply_keyboard(),
+        )
 
 
 @router.message(CommandStart())
