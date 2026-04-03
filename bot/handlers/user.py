@@ -48,6 +48,7 @@ from bot.services.booking_schedule import (
     parse_booking_start_text,
     point_inside_busy,
     rent_lo_hi,
+    reservation_fits,
     validate_new_reservation,
     MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START,
     user_may_cancel_reservation,
@@ -225,7 +226,6 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         st = await user_facing_status(session, item_id)
         await session.commit()
 
-    now = datetime.now(UTC)
     extra = ""
     b = InlineKeyboardBuilder()
     if st.pending_admin:
@@ -261,17 +261,29 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
                 callback_data=f"book:{item_id}",
             ),
         )
-    elif st.next_booking_start > now:
+    elif st.in_reserved_slot and st.reserved_until is not None:
         extra = (
-            "\n\n📅 <b>Статус:</b> есть запланированные брони — нажмите «Забронировать» "
-            "и укажите дату/время начала; свободные промежутки не пересекаются с чужими слотами."
+            f"\n\n🔒 <b>Статус:</b> занята по брони до "
+            f"<b>{_fmt_utc_local(st.reserved_until, settings)}</b> — можно забронировать время "
+            "после окончания этого слота."
         )
-        b.row(
-            InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"),
-        )
-    else:
-        extra = "\n\n✅ <b>Статус:</b> свободна — можно взять в аренду."
+        b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
+    elif st.immediate_rent_max_hours >= st.min_rent_hours:
+        lo_i, hi_i = rent_hours_bounds(item)
+        extra = "\n\n✅ <b>Статус:</b> можно взять в аренду сейчас."
+        if st.immediate_rent_max_hours < hi_i:
+            extra += (
+                f"\nДо ближайшей занятости можно взять не более "
+                f"<b>{st.immediate_rent_max_hours}</b> ч."
+            )
         b.row(InlineKeyboardButton(text="Взять в аренду", callback_data=f"take:{item_id}"))
+        b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
+    else:
+        extra = (
+            "\n\n📅 <b>Статус:</b> сейчас нельзя взять на минимальный срок — либо вещь скоро занята "
+            "по брони, либо до ближайшей занятости слишком короткое «окно». Нажмите «Забронировать» "
+            "и выберите удобное время из свободных слотов."
+        )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
 
     b.row(InlineKeyboardButton(text="« Главное меню", callback_data="u:home"))
@@ -314,10 +326,14 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
             await query.answer("Вещь сейчас недоступна для прямой аренды", show_alert=True)
         return
     lo, hi = rent_hours_bounds(item)
+    hi_cap = st.immediate_rent_max_hours
     await state.clear()
     await state.set_state(UserRentStates.waiting_hours)
-    await state.update_data(item_id=item_id, flow="rent")
-    hours_line = f"Укажите срок аренды в часах (целое число от {lo} до {hi}):"
+    await state.update_data(item_id=item_id, flow="rent", immediate_max_hours=hi_cap)
+    hours_line = (
+        f"Укажите срок аренды в часах (целое число от {lo} до {hi_cap}; "
+        f"не больше окна до ближайшей занятости):"
+    )
     await query.message.answer(
         hours_line + notice,
         reply_markup=home_keyboard(),
@@ -473,9 +489,10 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
         await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
         return
     lo, hi = rent_hours_bounds(item)
-    if h < lo or h > hi:
+    cap = min(int(data.get("immediate_max_hours", hi)), hi)
+    if h < lo or h > cap:
         await message.answer(
-            f"Допустимо от {lo} до {hi} часов.",
+            f"Допустимо от {lo} до {cap} часов (сейчас до ближайшей занятости не больше {cap} ч.).",
             reply_markup=home_keyboard(),
         )
         return
@@ -543,13 +560,26 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
             await query.answer("Вещь не найдена", show_alert=True)
             return
         lo, hi = rent_hours_bounds(item)
-        if hours < lo or hours > hi:
+        cap = min(int(data.get("immediate_max_hours", hi)), hi)
+        if hours < lo or hours > cap:
             await session.rollback()
-            await query.answer(f"Недопустимый срок: от {lo} до {hi} ч.", show_alert=True)
+            await query.answer(
+                f"Недопустимый срок: от {lo} до {cap} ч. (окно до ближайшей занятости).",
+                show_alert=True,
+            )
+            await state.clear()
+            return
+        busy = await load_busy_intervals_utc(session, item_id)
+        planned_end = now + timedelta(hours=hours)
+        if not reservation_fits(busy, now, planned_end):
+            await session.rollback()
+            await query.answer(
+                "Слот пересекается с бронью или окном недоступности — выберите меньше часов или позже.",
+                show_alert=True,
+            )
             await state.clear()
             return
         total = price_for_hours(item, hours)
-        planned_end = now + timedelta(hours=hours)
         rental = Rental(
             item_id=item_id,
             user_id=query.from_user.id,

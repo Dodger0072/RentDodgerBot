@@ -63,7 +63,9 @@ async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> lis
     r_rent = await session.execute(
         select(Rental).where(
             Rental.item_id == item_id,
-            Rental.state == RentalState.active.value,
+            Rental.state.in_(
+                (RentalState.active.value, RentalState.pending_admin.value)
+            ),
         )
     )
     for r in r_rent.scalars():

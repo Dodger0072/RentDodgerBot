@@ -76,6 +76,10 @@ class ItemStatus:
     pending_admin: bool
     active_rental: Rental | None
     next_booking_start: datetime
+    min_rent_hours: int
+    immediate_rent_max_hours: int
+    in_reserved_slot: bool
+    reserved_until: datetime | None
     in_blackout: bool
     blackout_until: datetime | None = None
 
@@ -96,17 +100,53 @@ def item_now_in_item_blackout(blackouts: list[ItemBlackout], ref_now: datetime) 
     return blackout_max_end_covering_now(blackouts, ref_now) is not None
 
 
+def reservation_covering_now(
+    reservations: list[Reservation], ref_now: datetime
+) -> Reservation | None:
+    now_u = ensure_utc(ref_now) or datetime.now(UTC)
+    for r in reservations:
+        s, e = ensure_utc(r.start_at), ensure_utc(r.end_at)
+        if s is not None and e is not None and s <= now_u < e:
+            return r
+    return None
+
+
+def _compute_immediate_rent_cap_hours(
+    now: datetime,
+    busy: list[tuple[datetime, datetime]],
+    lo: int,
+    hi: int,
+) -> int:
+    """Целые часы «взять сейчас»: до ближайшего начала занятости, в пределах [lo, hi]."""
+    from bot.services.booking_schedule import next_busy_start_after, point_inside_busy
+
+    now_u = ensure_utc(now) or datetime.now(UTC)
+    if point_inside_busy(now_u, busy):
+        return 0
+    nxt = next_busy_start_after(now_u, busy)
+    if nxt is None:
+        return hi
+    secs = (nxt - now_u).total_seconds()
+    if secs <= 0:
+        return 0
+    slot = int(secs // 3600)
+    cap = min(hi, slot)
+    return cap if cap >= lo else 0
+
+
 def item_list_button_text(name: str, st: ItemStatus, *, ref_now: datetime) -> str:
     if st.pending_admin:
         icon = "⏳"
     elif st.active_rental is not None:
         icon = "🔒"
+    elif st.in_reserved_slot:
+        icon = "🔒"
     elif st.in_blackout:
         icon = "⛔"
-    elif st.next_booking_start > ref_now:
-        icon = "📅"
-    else:
+    elif st.immediate_rent_max_hours >= st.min_rent_hours:
         icon = "✅"
+    else:
+        icon = "📅"
     text = f"{icon} {name.strip()}"
     if len(text) > 64:
         text = text[:61] + "…"
@@ -114,11 +154,13 @@ def item_list_button_text(name: str, st: ItemStatus, *, ref_now: datetime) -> st
 
 
 def can_take_immediate_rent(st: ItemStatus, ref_now: datetime) -> bool:
+    _ = ref_now
     return (
         not st.pending_admin
         and not st.in_blackout
         and st.active_rental is None
-        and st.next_booking_start <= ref_now
+        and not st.in_reserved_slot
+        and st.immediate_rent_max_hours >= st.min_rent_hours
     )
 
 
@@ -150,7 +192,13 @@ async def items_availability_batch(
     for row in r_bo.scalars():
         bo_by[row.item_id].append(row)
 
+    from bot.services.booking_schedule import load_busy_intervals_utc
+
+    r_items = await session.execute(select(Item).where(Item.id.in_(item_ids)))
+    items_map: dict[int, Item] = {it.id: it for it in r_items.scalars().all()}
+
     for iid in item_ids:
+        item = items_map[iid]
         rentals = rentals_by.get(iid, [])
         reservations = res_by.get(iid, [])
         pending = any(r.state == RentalState.pending_admin.value for r in rentals)
@@ -163,14 +211,30 @@ async def items_availability_batch(
                 continue
             active = r
             break
-        nxt = next_booking_start_utc(ref_now, active, reservations)
+        res_cov = reservation_covering_now(reservations, ref_now)
+        in_rs = res_cov is not None
+        res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
+
         bo_list = bo_by.get(iid, [])
         bu = blackout_max_end_covering_now(bo_list, ref_now)
         in_bo = bu is not None
+
+        busy = await load_busy_intervals_utc(session, iid)
+        lo, hi = rent_hours_bounds(item)
+        if pending or in_bo or active is not None or in_rs:
+            imm = 0
+        else:
+            imm = _compute_immediate_rent_cap_hours(ref_now, busy, lo, hi)
+
+        nxt = next_booking_start_utc(ref_now, active, reservations)
         out[iid] = ItemStatus(
             pending_admin=pending,
             active_rental=active,
             next_booking_start=nxt,
+            min_rent_hours=lo,
+            immediate_rent_max_hours=imm,
+            in_reserved_slot=in_rs,
+            reserved_until=res_end,
             in_blackout=in_bo,
             blackout_until=bu,
         )
@@ -234,6 +298,8 @@ def next_booking_start_utc(
 
 
 async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus | None:
+    from bot.services.booking_schedule import load_busy_intervals_utc
+
     await expire_expired_rentals(session)
     item, rentals, reservations = await _load_item_rentals_reservations(session, item_id)
     if item is None:
@@ -256,11 +322,26 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
     bu = blackout_max_end_covering_now(blackouts, now)
     in_bo = bu is not None
 
+    res_cov = reservation_covering_now(reservations, now)
+    in_rs = res_cov is not None
+    res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
+
+    busy = await load_busy_intervals_utc(session, item_id)
+    lo, hi = rent_hours_bounds(item)
+    if pending or in_bo or active is not None or in_rs:
+        imm = 0
+    else:
+        imm = _compute_immediate_rent_cap_hours(now, busy, lo, hi)
+
     nxt = next_booking_start_utc(now, active, reservations)
     return ItemStatus(
         pending_admin=pending,
         active_rental=active,
         next_booking_start=nxt,
+        min_rent_hours=lo,
+        immediate_rent_max_hours=imm,
+        in_reserved_slot=in_rs,
+        reserved_until=res_end,
         in_blackout=in_bo,
         blackout_until=bu,
     )
