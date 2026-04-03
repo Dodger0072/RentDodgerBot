@@ -66,6 +66,17 @@ async def _migrate_sqlite_item_display_order(conn) -> None:
         )
 
 
+async def _migrate_sqlite_item_rent_hours(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(items)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "rent_hours_min" not in cols:
+        await conn.execute(text("ALTER TABLE items ADD COLUMN rent_hours_min INTEGER"))
+    if "rent_hours_max" not in cols:
+        await conn.execute(text("ALTER TABLE items ADD COLUMN rent_hours_max INTEGER"))
+
+
 async def init_db() -> None:
     if engine is None:
         raise RuntimeError("Engine not configured")
@@ -75,3 +86,4 @@ async def init_db() -> None:
         await _migrate_sqlite_item_owner(conn)
         await _migrate_sqlite_item_category(conn)
         await _migrate_sqlite_item_display_order(conn)
+        await _migrate_sqlite_item_rent_hours(conn)

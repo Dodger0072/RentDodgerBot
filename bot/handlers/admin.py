@@ -35,6 +35,7 @@ from bot.services.item_owner import (
     items_blackout_scope_for_admin,
 )
 from bot.services.rental import (
+    MAX_RENT_HOURS,
     ensure_utc,
     expire_expired_rentals,
     format_money,
@@ -81,7 +82,7 @@ async def _finalize_rental_handover(
     rental.start_at = now
     rental.end_at = end
     try:
-        total = price_for_hours(item, req_hours, strict_paid_min=False)
+        total = price_for_hours(item, req_hours)
     except ValueError:
         total = Decimal("0")
     await session.commit()
@@ -176,35 +177,92 @@ async def add_item_is_paid(message: Message, state: FSMContext, settings: Settin
     t = message.text.strip().lower()
     if "бесплат" in t:
         await state.update_data(is_paid=False)
-        async with db_session.async_session_maker() as session:
-            data = await state.get_data()
-            ord_val = await next_display_order_for_group(
-                session, is_paid=False, item_category=data.get("item_category")
-            )
-            item = Item(
-                name=data["name"],
-                description=data["description"],
-                photos_json=json.dumps(data.get("photos") or [], ensure_ascii=False),
-                is_paid=False,
-                price_hour=None,
-                price_day=None,
-                price_week=None,
-                item_category=data.get("item_category"),
-                display_order=ord_val,
-                owner_user_id=message.from_user.id,
-                owner_username=message.from_user.username,
-            )
-            session.add(item)
-            await session.commit()
-        await state.clear()
-        await message.answer("Вещь добавлена (бесплатная аренда).")
+        await state.set_state(AddItemStates.rent_hours_min)
+        await message.answer(
+            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+        )
         return
     if "плат" in t:
         await state.update_data(is_paid=True)
+        await state.set_state(AddItemStates.rent_hours_min)
+        await message.answer(
+            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+        )
+        return
+    await message.answer("Напишите «платная» или «бесплатная».")
+
+
+@router.message(AddItemStates.rent_hours_min, F.text)
+async def add_item_rent_hours_min(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        n = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число часов (от 1 до 168).")
+        return
+    if n < 1 or n > MAX_RENT_HOURS:
+        await message.answer(f"Укажите число от 1 до {MAX_RENT_HOURS}.")
+        return
+    await state.update_data(rent_hours_min=n)
+    await state.set_state(AddItemStates.rent_hours_max)
+    await message.answer(
+        f"Максимальный срок аренды в часах "
+        f"(не меньше {n}, не больше {MAX_RENT_HOURS}):"
+    )
+
+
+@router.message(AddItemStates.rent_hours_max, F.text)
+async def add_item_rent_hours_max(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    n = data.get("rent_hours_min")
+    if n is None:
+        await state.clear()
+        return
+    try:
+        m = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число часов.")
+        return
+    if m < n or m > MAX_RENT_HOURS:
+        await message.answer(f"Допустимо от {n} до {MAX_RENT_HOURS} ч.")
+        return
+    if data.get("is_paid"):
+        await state.update_data(rent_hours_max=m)
         await state.set_state(AddItemStates.price_hour)
         await message.answer("Введите цену за час (число, например 100):")
         return
-    await message.answer("Напишите «платная» или «бесплатная».")
+    async with db_session.async_session_maker() as session:
+        ord_val = await next_display_order_for_group(
+            session, is_paid=False, item_category=data.get("item_category")
+        )
+        item = Item(
+            name=data["name"],
+            description=data["description"],
+            photos_json=json.dumps(data.get("photos") or [], ensure_ascii=False),
+            is_paid=False,
+            price_hour=None,
+            price_day=None,
+            price_week=None,
+            item_category=data.get("item_category"),
+            display_order=ord_val,
+            owner_user_id=message.from_user.id,
+            owner_username=message.from_user.username,
+            rent_hours_min=int(n),
+            rent_hours_max=m,
+        )
+        session.add(item)
+        await session.commit()
+    await state.clear()
+    await message.answer("Вещь добавлена (бесплатная аренда).")
 
 
 @router.message(AddItemStates.price_hour, F.text)
@@ -264,6 +322,8 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
             display_order=ord_val,
             owner_user_id=message.from_user.id,
             owner_username=message.from_user.username,
+            rent_hours_min=int(data["rent_hours_min"]),
+            rent_hours_max=int(data["rent_hours_max"]),
         )
         session.add(item)
         await session.commit()
@@ -300,7 +360,8 @@ async def cmd_list_items(message: Message, settings: Settings) -> None:
         elif it.owner_user_id == uid:
             own = " | ваша"
         ic = item_category_label(it.item_category)
-        lines.append(f"{it.id}. {it.name} ({cat} | {ic}{own})")
+        lo, hi = rent_hours_bounds(it)
+        lines.append(f"{it.id}. {it.name} ({cat} | {lo}–{hi}ч | {ic}{own})")
     await message.answer("Ваши и общие вещи:\n" + "\n".join(lines))
 
 

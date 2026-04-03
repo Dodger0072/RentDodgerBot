@@ -44,6 +44,8 @@ class Item(Base):
     owner_username = mapped_column(String(255), nullable=True)
     item_category = mapped_column(String(64), nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rent_hours_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rent_hours_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     rentals: Mapped[List["Rental"]] = relationship(back_populates="item")
     reservations: Mapped[List["Reservation"]] = relationship(back_populates="item")

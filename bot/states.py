@@ -7,6 +7,8 @@ class AddItemStates(StatesGroup):
     category = State()
     photos = State()
     is_paid = State()
+    rent_hours_min = State()
+    rent_hours_max = State()
     price_hour = State()
     price_day = State()
     price_week = State()
