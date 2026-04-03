@@ -278,6 +278,44 @@ def free_segments_excluding_blackout(
     return [(s, e) for s, e in segs if e > s]
 
 
+def _same_instant(a: datetime | None, b: datetime | None) -> bool:
+    au, bu = ensure_utc(a), ensure_utc(b)
+    if au is None or bu is None:
+        return False
+    return abs((au - bu).total_seconds()) < 1.0
+
+
+def _segment_cap_explanation(
+    se: datetime,
+    rr_merged: list[tuple[datetime, datetime]],
+    bo_merged: list[tuple[datetime, datetime]],
+    settings: Settings,
+) -> str:
+    """Краткая подпись к правой границе окна (RR vs blackout)."""
+    se_u = ensure_utc(se)
+    if se_u is None:
+        return f"Ограничение по слоту с {format_local_time(se, settings)}."
+
+    bo_txt = ""
+    for bs, _ in bo_merged:
+        if _same_instant(se_u, bs):
+            bo_txt = f"С {format_local_time(bs, settings)} нельзя указать начало брони."
+            break
+    # RR: граница совпадает с началом занятости вещи по брони/аренде
+    rr_txt = ""
+    for bs, _ in rr_merged:
+        if _same_instant(se_u, bs):
+            rr_txt = f"Следующая бронь/аренда с {format_local_time(bs, settings)}."
+            break
+    if bo_txt and rr_txt:
+        return f"{bo_txt} {rr_txt}"
+    if bo_txt:
+        return bo_txt
+    if rr_txt:
+        return rr_txt
+    return f"Ограничение по слоту с {format_local_time(se, settings)}."
+
+
 async def format_user_booking_availability_block(
     session: AsyncSession,
     item_id: int,
@@ -286,7 +324,7 @@ async def format_user_booking_availability_block(
     *,
     now: datetime | None = None,
 ) -> str:
-    """HTML: окна времени начала брони с учётом минимума часов до ближайшей RR-занятости."""
+    """HTML: окна времени начала брони (RR и отдельно blackout — не путать с чужой бронью)."""
     now_u = ensure_utc(now) or datetime.now(UTC)
     lo, hi = rent_lo_hi(item)
     rr = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
@@ -302,10 +340,10 @@ async def format_user_booking_availability_block(
         latest = se - timedelta(hours=lo)
         if latest < sa:
             return
-        busy_lbl = format_local_time(se, settings)
+        cap_txt = _segment_cap_explanation(se, rr, bo, settings)
         lines.append(
             f"• с <b>{format_local_time(sa, settings)}</b> до <b>{format_local_time(latest, settings)}</b>\n"
-            f"  <i>время начала; при мин. {lo} ч следующая бронь/аренда с {busy_lbl}</i>"
+            f"  {cap_txt}"
         )
 
     def add_open(sa: datetime) -> None:
@@ -314,8 +352,8 @@ async def format_user_booking_availability_block(
             return
         lines.append(
             f"• с <b>{format_local_time(sa, settings)}</b>\n"
-            f"  <i>в очереди нет ближайшей брони/аренды; длительность от {lo} до {hi} ч "
-            f"(не дольше {MAX_RENT_HOURS} ч подряд от начала)</i>"
+            f"  Нет ближайшей брони в очереди; длительность {lo}–{hi} ч "
+            f"(не дольше {MAX_RENT_HOURS} ч подряд)."
         )
 
     for s, e in rr:
@@ -358,8 +396,7 @@ async def format_user_booking_availability_block(
 
     head = (
         "<b>Когда можно начать бронь</b>\n"
-        f"<i>Вторая дата — последнее подходящее <b>начало</b> слота при минимуме {lo} ч "
-        f"до следующей брони или аренды.</i>\n\n"
+        f"<i>Вторая дата — крайнее подходящее начало при минимуме {lo} ч.</i>\n\n"
     )
     return head + "\n".join(lines) + tail
 
