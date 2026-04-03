@@ -10,6 +10,7 @@ def admin_item_category_keyboard() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for slug, label in ITEM_CATEGORIES:
         b.row(InlineKeyboardButton(text=label, callback_data=f"adm:addcat:{slug}"))
+    b.row(InlineKeyboardButton(text="« Назад", callback_data="adm:addcat:back"))
     return b.as_markup()
 
 

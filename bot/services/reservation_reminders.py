@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from html import escape
 
@@ -17,6 +17,10 @@ from bot.db import session as db_session
 from bot.db.models import Rental, RentalState, Reservation
 from bot.services.admin_notify import notify_admins_pending_rental
 from bot.services.rental import ensure_utc, expire_expired_rentals, price_for_hours
+from bot.services.user_discipline import (
+    NO_RESPONSE_AFTER_START_MINUTES,
+    add_warning,
+)
 from bot.time_format import format_local_time
 
 logger = logging.getLogger(__name__)
@@ -171,11 +175,51 @@ async def _send_reminder(bot: Bot, user_id: int, text: str) -> None:
         logger.exception("Reminder error for %s", user_id)
 
 
+async def process_rental_no_response_warnings(bot: Bot, settings: Settings) -> None:
+    """Пенальти: заявка pending_admin, срок start_at + 15 мин прошёл — 1 предупреждение (раз на заявку)."""
+    now = datetime.now(UTC)
+    async with db_session.async_session_maker() as session:
+        q = await session.execute(
+            select(Rental).where(
+                Rental.state == RentalState.pending_admin.value,
+                Rental.no_response_penalty_applied.is_(False),
+            )
+        )
+        rows = list(q.scalars().all())
+        changed = False
+        for rental in rows:
+            start = ensure_utc(rental.start_at)
+            if start is None:
+                continue
+            if now < start + timedelta(minutes=NO_RESPONSE_AFTER_START_MINUTES):
+                continue
+            rental.no_response_penalty_applied = True
+            changed = True
+            reason = (
+                f"<b>Нет ответа арендодателю</b> в течение {NO_RESPONSE_AFTER_START_MINUTES} мин. "
+                "после начала срока аренды по заявке из бота."
+            )
+            await add_warning(
+                session,
+                user_id=rental.user_id,
+                username=rental.username,
+                reason_html=reason,
+                bot=bot,
+                ban_note=(
+                    "Автоматически: нет ответа арендодателю после начала срока аренды "
+                    f"(заявка rental_id={rental.id})."
+                ),
+            )
+        if changed:
+            await session.commit()
+
+
 async def reservation_reminder_loop(bot: Bot, settings: Settings, interval_sec: float = 45.0) -> None:
     while True:
         try:
             await asyncio.sleep(interval_sec)
             await process_reservation_booking_starts(bot, settings)
+            await process_rental_no_response_warnings(bot, settings)
             await process_reservation_reminders(bot, settings)
         except asyncio.CancelledError:
             break

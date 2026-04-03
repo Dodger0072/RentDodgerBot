@@ -13,6 +13,17 @@ class Base(DeclarativeBase):
     pass
 
 
+class UserRentalDiscipline(Base):
+    """Предупреждения арендатора: 3 → бан; успешные выдачи обнуляют счётчик предупреждений."""
+
+    __tablename__ = "user_rental_discipline"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username_norm: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    warnings: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    successful_handovers: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class UserBan(Base):
     """Запрет доступа к боту по @username (и при наличии — по telegram user id)."""
     __tablename__ = "user_bans"
@@ -79,6 +90,9 @@ class Rental(Base):
     requested_hours: Mapped[int] = mapped_column(Integer, nullable=False)
     admin_message_chat_id = mapped_column(BigInteger, nullable=True)
     admin_message_id = mapped_column(BigInteger, nullable=True)
+    no_response_penalty_applied: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     item: Mapped["Item"] = relationship(back_populates="rentals")
 

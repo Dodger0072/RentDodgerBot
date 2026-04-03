@@ -51,6 +51,7 @@ from bot.services.rental import (
     rent_hours_bounds,
     user_facing_status,
 )
+from bot.services.user_discipline import booking_rules_block, near_ban_notice_for_user
 from bot.states import UserBookStates, UserRentStates
 
 router = Router(name="user")
@@ -263,6 +264,7 @@ async def user_home(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.regexp(r"^take:(\d+)$"))
 async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     item_id = int(query.data.split(":")[1])
+    notice = ""
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
         await session.commit()
@@ -270,6 +272,7 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
         ref_now = datetime.now(UTC)
         r_item = await session.execute(select(Item).where(Item.id == item_id))
         item = r_item.scalar_one_or_none()
+        notice = await near_ban_notice_for_user(session, query.from_user.id)
         await session.commit()
     if st is None or item is None:
         await query.answer("Ошибка", show_alert=True)
@@ -287,9 +290,11 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
     await state.clear()
     await state.set_state(UserRentStates.waiting_hours)
     await state.update_data(item_id=item_id, flow="rent")
+    hours_line = f"Укажите срок аренды в часах (целое число от {lo} до {hi}):"
     await query.message.answer(
-        f"Укажите срок аренды в часах (целое число от {lo} до {hi}):",
+        hours_line + notice,
         reply_markup=home_keyboard(),
+        parse_mode=ParseMode.HTML if notice else None,
     )
     await query.answer()
 
@@ -313,6 +318,10 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
     if book_item is None:
         await query.answer("Вещь не найдена", show_alert=True)
         return
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, query.from_user.id)
+        await session.commit()
     await state.clear()
     await state.set_state(UserBookStates.waiting_start_datetime)
     await state.update_data(item_id=item_id, flow="book")
@@ -327,6 +336,9 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
             f"\nСейчас до <b>{_fmt_utc_local(st.blackout_until, settings)}</b> владелец не сдаёт вещь — "
             f"укажите начало <b>после</b> этого времени (слот не должен с этим пересекаться)."
         )
+    lines.append(booking_rules_block())
+    if notice:
+        lines.append(notice)
     await query.message.answer(
         "".join(lines),
         reply_markup=home_keyboard(),
@@ -399,11 +411,16 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
     cap_end = max_reservation_end_utc(parsed, busy)
     await state.update_data(book_start_iso=parsed.isoformat())
     await state.set_state(UserBookStates.waiting_hours)
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        await session.commit()
     await message.answer(
         f"Начало: <b>{_fmt_utc_local(parsed, settings)}</b>.\n"
         f"Можно забронировать не длиннее <b>{max_h}</b> ч. "
         f"(не позже {_fmt_utc_local(cap_end, settings)} — дальше уже занято или лимит {hi} ч.).\n"
-        f"Введите число часов от <b>{lo}</b> до <b>{max_h}</b>:",
+        f"Введите число часов от <b>{lo}</b> до <b>{max_h}</b>:"
+        + notice,
         reply_markup=home_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -443,18 +460,24 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
             reply_markup=home_keyboard(),
         )
         return
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        await session.commit()
     await state.update_data(hours=h, total=str(total))
     await state.set_state(UserRentStates.waiting_confirm)
     if item.is_paid:
         await message.answer(
-            f"Итого за {h} ч: <b>{format_money(total)}</b>\nПодтвердить заявку?",
+            f"Итого за {h} ч: <b>{format_money(total)}</b>\nПодтвердить заявку?"
+            + notice,
             reply_markup=confirm_keyboard("rent", item_id),
             parse_mode=ParseMode.HTML,
         )
     else:
         await message.answer(
-            f"Аренда бесплатная ({h} ч).\nПодтвердить заявку?",
+            f"Аренда бесплатная ({h} ч).\nПодтвердить заявку?" + notice,
             reply_markup=confirm_keyboard("rent", item_id),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -585,18 +608,27 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
             reply_markup=home_keyboard(),
         )
         return
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        await session.commit()
     await state.update_data(hours=h, total=str(total))
     await state.set_state(UserBookStates.waiting_confirm)
     if item.is_paid:
         await message.answer(
-            f"Итого за {h} ч: <b>{format_money(total)}</b>\nПодтвердить бронь?",
+            f"Итого за {h} ч: <b>{format_money(total)}</b>\nПодтвердить бронь?"
+            + booking_rules_block()
+            + notice,
             reply_markup=confirm_keyboard("book", item_id),
             parse_mode=ParseMode.HTML,
         )
     else:
         await message.answer(
-            f"Бронь бесплатная ({h} ч).\nПодтвердить?",
+            f"Бронь бесплатная ({h} ч).\nПодтвердить?"
+            + booking_rules_block()
+            + notice,
             reply_markup=confirm_keyboard("book", item_id),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -675,7 +707,9 @@ async def user_book_confirm(
         await session.commit()
     await state.clear()
     await query.message.edit_text(
-        f"Бронь создана с {_fmt_utc_local(start_at, settings)} по {_fmt_utc_local(end_at, settings)}.",
+        f"Бронь создана с {_fmt_utc_local(start_at, settings)} по {_fmt_utc_local(end_at, settings)}.\n\n"
+        f"<i>Свяжитесь с арендодателем вовремя — см. правила предупреждений выше.</i>",
         reply_markup=home_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     await query.answer()

@@ -66,6 +66,19 @@ async def _migrate_sqlite_item_display_order(conn) -> None:
         )
 
 
+async def _migrate_sqlite_rental_no_response_penalty(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(rentals)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "no_response_penalty_applied" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE rentals ADD COLUMN no_response_penalty_applied BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+
+
 async def _migrate_sqlite_item_rent_hours(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -87,3 +100,4 @@ async def init_db() -> None:
         await _migrate_sqlite_item_category(conn)
         await _migrate_sqlite_item_display_order(conn)
         await _migrate_sqlite_item_rent_hours(conn)
+        await _migrate_sqlite_rental_no_response_penalty(conn)

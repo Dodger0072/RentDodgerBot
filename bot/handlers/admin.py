@@ -42,7 +42,20 @@ from bot.services.rental import (
     price_for_hours,
     rent_hours_bounds,
 )
-from bot.services.user_bans import add_ban, list_bans, normalize_username, remove_ban_by_username
+from bot.services.user_bans import (
+    add_ban,
+    is_user_banned,
+    list_bans,
+    normalize_username,
+    remove_ban_by_username,
+)
+from bot.services.user_discipline import (
+    WARNINGS_BAN_THRESHOLD,
+    add_warning,
+    format_warn_reason_for_user,
+    list_users_with_warnings,
+    record_successful_handover,
+)
 from bot.time_format import format_local_time
 from bot.states import AddItemStates, AdminBlackoutStates, AdminRentalStates, AdminReservationStates
 from sqlalchemy import or_, select
@@ -51,6 +64,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 router = Router(name="admin")
+
+
+def _omit_fsm_keys(d: dict, *keys: str) -> dict:
+    drop = set(keys)
+    return {k: v for k, v in d.items() if k not in drop}
 
 
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
@@ -85,6 +103,7 @@ async def _finalize_rental_handover(
         total = price_for_hours(item, req_hours)
     except ValueError:
         total = Decimal("0")
+    await record_successful_handover(session, rental.user_id, rental.username)
     await session.commit()
     end_label = format_local_time(end, settings)
     text = (
@@ -99,7 +118,138 @@ async def cmd_add_item(message: Message, state: FSMContext, settings: Settings) 
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
     await state.set_state(AddItemStates.name)
-    await message.answer("Введите название вещи (как на кнопке у пользователя):")
+    await message.answer(
+        "Введите название вещи (как на кнопке у пользователя):\n\n"
+        "<i>Шаг назад в этом диалоге: /back (на первом шаге только подсказка). "
+        "Со слова «назад» то же самое, кроме ввода названия — там «назад» идёт в название.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(StateFilter(AddItemStates.category), F.data == "adm:addcat:back")
+async def add_item_category_back_cb(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        await state.clear()
+        return
+    data = dict(await state.get_data())
+    await state.set_data(_omit_fsm_keys(data, "item_category"))
+    await state.set_state(AddItemStates.description)
+    await query.message.edit_text("Введите описание:")
+    await query.answer()
+
+
+@router.message(StateFilter(AddItemStates), Command("back"))
+async def add_item_back_command(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    st = await state.get_state()
+    data = dict(await state.get_data())
+    if st == AddItemStates.name.state:
+        await message.answer(
+            "Вы на первом шаге. Введите название или начните заново: /add_item"
+        )
+        return
+    await _add_item_step_back(message, state, settings, st, data)
+
+
+@router.message(
+    StateFilter(
+        AddItemStates.description,
+        AddItemStates.category,
+        AddItemStates.photos,
+        AddItemStates.is_paid,
+        AddItemStates.rent_hours_min,
+        AddItemStates.rent_hours_max,
+        AddItemStates.price_hour,
+        AddItemStates.price_day,
+        AddItemStates.price_week,
+    ),
+    F.text.lower() == "назад",
+)
+async def add_item_back_word(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    st = await state.get_state()
+    data = dict(await state.get_data())
+    await _add_item_step_back(message, state, settings, st, data)
+
+
+async def _add_item_step_back(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    st: str,
+    data: dict,
+) -> None:
+    if st == AddItemStates.description.state:
+        await state.set_data(_omit_fsm_keys(data, "description"))
+        await state.set_state(AddItemStates.name)
+        await message.answer("Введите название вещи (как на кнопке у пользователя):")
+        return
+    if st == AddItemStates.category.state:
+        await state.set_data(_omit_fsm_keys(data, "item_category"))
+        await state.set_state(AddItemStates.description)
+        await message.answer("Введите описание:")
+        return
+    if st == AddItemStates.photos.state:
+        await state.set_data(_omit_fsm_keys(data, "item_category"))
+        await state.set_state(AddItemStates.category)
+        await message.answer(
+            "Выберите <b>категорию</b> вещи:",
+            reply_markup=admin_item_category_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if st == AddItemStates.is_paid.state:
+        await state.set_data(_omit_fsm_keys(data, "is_paid"))
+        await state.set_state(AddItemStates.photos)
+        await message.answer(
+            "Пришлите фото (можно несколько сообщений). Когда закончите — напишите /done."
+        )
+        return
+    if st == AddItemStates.rent_hours_min.state:
+        await state.set_data(_omit_fsm_keys(data, "rent_hours_min"))
+        await state.set_state(AddItemStates.is_paid)
+        await message.answer(
+            "Категория: платная или бесплатная аренда? Ответьте словом «платная» или «бесплатная»."
+        )
+        return
+    if st == AddItemStates.rent_hours_max.state:
+        await state.set_data(_omit_fsm_keys(data, "rent_hours_min"))
+        await state.set_state(AddItemStates.rent_hours_min)
+        await message.answer(
+            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+        )
+        return
+    if st == AddItemStates.price_hour.state:
+        new_data = _omit_fsm_keys(data, "price_hour", "rent_hours_max")
+        await state.set_data(new_data)
+        await state.set_state(AddItemStates.rent_hours_max)
+        n = new_data.get("rent_hours_min")
+        if n is None:
+            await state.set_state(AddItemStates.rent_hours_min)
+            await message.answer(
+                "Минимальный срок аренды в часах (целое число от 1 до 168):"
+            )
+            return
+        await message.answer(
+            f"Максимальный срок аренды в часах "
+            f"(не меньше {n}, не больше {MAX_RENT_HOURS}):"
+        )
+        return
+    if st == AddItemStates.price_day.state:
+        await state.set_data(_omit_fsm_keys(data, "price_day"))
+        await state.set_state(AddItemStates.price_hour)
+        await message.answer("Введите цену за час (число, например 100):")
+        return
+    if st == AddItemStates.price_week.state:
+        await state.set_data(_omit_fsm_keys(data, "price_week"))
+        await state.set_state(AddItemStates.price_day)
+        await message.answer("Цена за сутки (24 часа):")
 
 
 @router.message(AddItemStates.name, F.text)
@@ -544,6 +694,114 @@ async def cmd_list_bans(message: Message, settings: Settings) -> None:
             + (f"\n   {escape(b.note)}" if b.note else "")
         )
     text = "<b>Блокировки</b>\n\n" + "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("warn_user", "warn"))
+async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    tokens = (message.text or "").strip().split(maxsplit=2)
+    if len(tokens) < 2:
+        await message.answer(
+            "Использование: <code>/warn_user</code> или <code>/warn</code> — "
+            "затем <b>@username</b> или числовой <b>Telegram id</b>, при желании текст причины.\n"
+            "Пример: <code>/warn vasya не вышел на связь</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    target = tokens[1].strip()
+    reason_plain = tokens[2].strip() if len(tokens) > 2 else "Предупреждение от администратора."
+
+    user_id: int | None = None
+    username_for_row: str | None = None
+
+    if target.isdigit():
+        user_id = int(target)
+        if user_id <= 0:
+            await message.answer("Некорректный id.")
+            return
+    else:
+        uname = normalize_username(target)
+        if not uname:
+            await message.answer("Укажите непустой username (с @ или без).")
+            return
+        try:
+            chat = await bot.get_chat(f"@{uname}")
+            if chat.id and chat.id > 0:
+                user_id = int(chat.id)
+            username_for_row = chat.username or uname
+        except TelegramBadRequest:
+            await message.answer("Не удалось найти пользователя. Проверьте username.")
+            return
+
+    if user_id is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    admin_note = (
+        f"Предупреждение админа (id {message.from_user.id}). "
+        f"{reason_plain[:1500]}"
+    )
+    reason_html = (
+        "<b>Предупреждение от администратора.</b>\n"
+        f"{format_warn_reason_for_user(reason_plain)}"
+    )
+
+    try:
+        async with db_session.async_session_maker() as session:
+            if await is_user_banned(session, user_id=user_id, username=username_for_row):
+                await session.rollback()
+                await message.answer("Этот пользователь уже в списке блокировки.")
+                return
+            cnt, banned = await add_warning(
+                session,
+                user_id=user_id,
+                username=username_for_row,
+                reason_html=reason_html,
+                bot=bot,
+                ban_note=admin_note,
+            )
+            await session.commit()
+    except IntegrityError:
+        await message.answer(
+            "Не удалось сохранить (например, дубликат бана). Проверьте /list_bans.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD} предупреждений)." if banned else ""
+    await message.answer(
+        f"Готово. У пользователя <code>{user_id}</code> сейчас "
+        f"<b>{cnt}</b> предупреждений из {WARNINGS_BAN_THRESHOLD}.{extra}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("list_warnings"))
+async def cmd_list_warnings(message: Message, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    async with db_session.async_session_maker() as session:
+        rows = await list_users_with_warnings(session)
+        await session.commit()
+    if not rows:
+        await message.answer(
+            "Нет записей с ненулевым числом предупреждений "
+            f"(автобан при {WARNINGS_BAN_THRESHOLD})."
+        )
+        return
+    lines = []
+    for row in rows:
+        un = escape(row.username_norm or "—")
+        lines.append(
+            f"id <code>{row.user_id}</code> | @{un} | "
+            f"предупреждений: <b>{row.warnings}</b> | "
+            f"успешных выдач (счётчик): {row.successful_handovers}"
+        )
+    text = "<b>Предупреждения арендаторов</b>\n\n" + "\n".join(lines)
     if len(text) > 4000:
         text = text[:3990] + "…"
     await message.answer(text, parse_mode=ParseMode.HTML)
