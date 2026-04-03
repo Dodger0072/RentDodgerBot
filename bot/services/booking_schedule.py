@@ -333,11 +333,26 @@ async def format_user_booking_availability_block(
     lines: list[str] = []
     horizon = cursor + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
 
+    def _right_edge_is_rr_start(se: datetime) -> bool:
+        se_u = ensure_utc(se)
+        if se_u is None:
+            return False
+        for bs, _ in rr:
+            bu = ensure_utc(bs)
+            if bu is not None and _same_instant(se_u, bu):
+                return True
+        return False
+
     def add_finite(sa: datetime, se: datetime) -> None:
         nonlocal lines
         if len(lines) >= _AVAIL_UI_MAX_LINES:
             return
-        latest = se - timedelta(hours=lo)
+        # Перед чужой бронью/арендой нужно уложить минимум lo ч; окно «не дома»
+        # ограничивает только момент начала — бронь может пересекаться с ним дальше.
+        if _right_edge_is_rr_start(se):
+            latest = se - timedelta(hours=lo)
+        else:
+            latest = se - timedelta(minutes=1)
         if latest < sa:
             return
         cap_txt = _segment_cap_explanation(se, rr, bo, settings)
@@ -375,12 +390,15 @@ async def format_user_booking_availability_block(
             if len(lines) >= _AVAIL_UI_MAX_LINES:
                 break
             near_horizon = se >= horizon - timedelta(minutes=1)
-            latest = se - timedelta(hours=lo)
-            if latest < sa:
-                continue
             if near_horizon:
                 add_open(sa)
             else:
+                if _right_edge_is_rr_start(se):
+                    latest = se - timedelta(hours=lo)
+                else:
+                    latest = se - timedelta(minutes=1)
+                if latest < sa:
+                    continue
                 add_finite(sa, se)
 
     if not lines:
@@ -396,7 +414,8 @@ async def format_user_booking_availability_block(
 
     head = (
         "<b>Когда можно начать бронь</b>\n"
-        f"<i>Вторая дата — крайнее подходящее начало при минимуме {lo} ч.</i>\n\n"
+        "<i>Вторая дата — последнее подходящее начало в этом промежутке "
+        f"(только перед чужой бронью нужен запас минимум {lo} ч).</i>\n\n"
     )
     return head + "\n".join(lines) + tail
 
