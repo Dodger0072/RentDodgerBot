@@ -261,11 +261,13 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
                 callback_data=f"book:{item_id}",
             ),
         )
-    elif st.in_reserved_slot and st.reserved_until is not None:
+    elif st.in_reserved_slot:
+        until_l = (
+            _fmt_utc_local(st.reserved_until, settings) if st.reserved_until is not None else "—"
+        )
         extra = (
             f"\n\n🔒 <b>Статус:</b> занята по брони до "
-            f"<b>{_fmt_utc_local(st.reserved_until, settings)}</b> — можно забронировать время "
-            "после окончания этого слота."
+            f"<b>{until_l}</b> — можно забронировать время после окончания этого слота."
         )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
     elif st.immediate_rent_max_hours >= st.min_rent_hours:
@@ -280,9 +282,10 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
     else:
         extra = (
-            "\n\n📅 <b>Статус:</b> сейчас нельзя взять на минимальный срок — либо вещь скоро занята "
-            "по брони, либо до ближайшей занятости слишком короткое «окно». Нажмите «Забронировать» "
-            "и выберите удобное время из свободных слотов."
+            f"\n\n📅 <b>Статус:</b> сейчас нельзя взять сразу: минимальный срок для этой вещи "
+            f"<b>{st.min_rent_hours}</b> ч., а без пересечений с бронями, заявками и недоступностью "
+            f"укладывается не более <b>{st.immediate_rent_max_hours}</b> ч. "
+            f"Нажмите «Забронировать», чтобы выбрать время в свободном слоте."
         )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
 

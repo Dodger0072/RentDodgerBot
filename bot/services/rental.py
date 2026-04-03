@@ -117,21 +117,27 @@ def _compute_immediate_rent_cap_hours(
     lo: int,
     hi: int,
 ) -> int:
-    """Целые часы «взять сейчас»: до ближайшего начала занятости, в пределах [lo, hi]."""
-    from bot.services.booking_schedule import next_busy_start_after, point_inside_busy
+    """Макс. целое h в [lo..hi], чтобы [now, now+h) не пересекался с занятыми интервалами."""
+    from bot.services.booking_schedule import point_inside_busy, reservation_fits
 
     now_u = ensure_utc(now) or datetime.now(UTC)
     if point_inside_busy(now_u, busy):
         return 0
-    nxt = next_busy_start_after(now_u, busy)
-    if nxt is None:
-        return hi
-    secs = (nxt - now_u).total_seconds()
-    if secs <= 0:
-        return 0
-    slot = int(secs // 3600)
-    cap = min(hi, slot)
-    return cap if cap >= lo else 0
+
+    lo_b, hi_b = 0, hi
+    best = 0
+    while lo_b <= hi_b:
+        mid = (lo_b + hi_b + 1) // 2
+        if mid == 0:
+            ok = True
+        else:
+            ok = reservation_fits(busy, now_u, now_u + timedelta(hours=mid))
+        if ok:
+            best = mid
+            lo_b = mid + 1
+        else:
+            hi_b = mid - 1
+    return best if best >= lo else 0
 
 
 def item_list_button_text(name: str, st: ItemStatus, *, ref_now: datetime) -> str:
