@@ -18,6 +18,9 @@ class RentalStatsSnapshot:
     earned_week: Decimal
     earned_month: Decimal
     handovers_total: int
+    handovers_today: int
+    handovers_week: int
+    handovers_month: int
 
 
 def _utc_range_today_week_month(settings: Settings, ref_utc: datetime | None = None) -> tuple[datetime, datetime, datetime]:
@@ -58,11 +61,39 @@ async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> Renta
         )
     )
 
+    cnt_today = await session.scalar(
+        select(func.count())
+        .select_from(RentalHandoverStat)
+        .where(
+            RentalHandoverStat.handed_over_at >= today_start,
+            RentalHandoverStat.handed_over_at <= now_utc,
+        )
+    )
+    cnt_week = await session.scalar(
+        select(func.count())
+        .select_from(RentalHandoverStat)
+        .where(
+            RentalHandoverStat.handed_over_at >= week_start,
+            RentalHandoverStat.handed_over_at <= now_utc,
+        )
+    )
+    cnt_month = await session.scalar(
+        select(func.count())
+        .select_from(RentalHandoverStat)
+        .where(
+            RentalHandoverStat.handed_over_at >= month_start,
+            RentalHandoverStat.handed_over_at <= now_utc,
+        )
+    )
+
     t = total if total is not None else Decimal("0")
     et = earned_today if earned_today is not None else Decimal("0")
     ew = earned_week if earned_week is not None else Decimal("0")
     em = earned_month if earned_month is not None else Decimal("0")
     c = int(cnt or 0)
+    ct = int(cnt_today or 0)
+    cw = int(cnt_week or 0)
+    cm = int(cnt_month or 0)
 
     return RentalStatsSnapshot(
         earned_total=Decimal(t),
@@ -70,6 +101,9 @@ async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> Renta
         earned_week=Decimal(ew),
         earned_month=Decimal(em),
         handovers_total=c,
+        handovers_today=ct,
+        handovers_week=cw,
+        handovers_month=cm,
     )
 
 

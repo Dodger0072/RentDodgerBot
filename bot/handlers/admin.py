@@ -1123,7 +1123,13 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
         f"За сегодня: {format_money(snap.earned_today)}\n"
         f"За неделю: {format_money(snap.earned_week)}\n"
         f"За месяц: {format_money(snap.earned_month)}\n\n"
-        f"Сдано аксессуаров всего: {snap.handovers_total}"
+        f"Сдано аксессуаров всего: {snap.handovers_total}\n"
+        f"За сегодня: {snap.handovers_today}\n"
+        f"За неделю: {snap.handovers_week}\n"
+        f"За месяц: {snap.handovers_month}\n\n"
+        "<i>Учёт только с момента появления этой статистики: при каждой новой выдаче "
+        "(подтверждение часов в боте) пишется строка в БД. Старые выдачи и аренды, "
+        "которые бот потом удаляет после срока, в прошлое не восстанавливаются.</i>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
