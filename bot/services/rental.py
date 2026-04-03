@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
 
 MAX_RENT_HOURS = 168
+MAX_RENT_HOURS_FREE = 12
 MIN_RENT_HOURS_FREE = 1
 MIN_RENT_HOURS_PAID = 3
 
@@ -26,8 +27,9 @@ def ensure_utc(dt: datetime | None) -> datetime | None:
 
 
 def rent_hours_bounds(item: Item) -> tuple[int, int]:
-    lo = MIN_RENT_HOURS_PAID if item.is_paid else MIN_RENT_HOURS_FREE
-    return lo, MAX_RENT_HOURS
+    if item.is_paid:
+        return MIN_RENT_HOURS_PAID, MAX_RENT_HOURS
+    return MIN_RENT_HOURS_FREE, MAX_RENT_HOURS_FREE
 
 
 def _int_grouped_dots(n: int) -> str:
@@ -49,12 +51,15 @@ def format_money(value: Decimal) -> str:
 
 def price_for_hours(item: Item, hours: int, *, strict_paid_min: bool = True) -> Decimal:
     min_h = MIN_RENT_HOURS_PAID if (item.is_paid and strict_paid_min) else MIN_RENT_HOURS_FREE
-    if hours < min_h or hours > MAX_RENT_HOURS:
+    max_h = MAX_RENT_HOURS if item.is_paid else MAX_RENT_HOURS_FREE
+    if hours < min_h or hours > max_h:
         if item.is_paid and strict_paid_min:
             raise ValueError(
                 f"Платная аренда: от {MIN_RENT_HOURS_PAID} до {MAX_RENT_HOURS} часов."
             )
-        raise ValueError(f"Допустимо от {MIN_RENT_HOURS_FREE} до {MAX_RENT_HOURS} часов.")
+        raise ValueError(
+            f"Бесплатная аренда: от {MIN_RENT_HOURS_FREE} до {MAX_RENT_HOURS_FREE} часов."
+        )
     if not item.is_paid:
         return Decimal("0")
     ph, pd, pw = item.price_hour, item.price_day, item.price_week

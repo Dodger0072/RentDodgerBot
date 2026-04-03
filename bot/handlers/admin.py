@@ -34,7 +34,13 @@ from bot.services.item_owner import (
     admin_manages_item,
     items_blackout_scope_for_admin,
 )
-from bot.services.rental import ensure_utc, expire_expired_rentals, format_money, price_for_hours
+from bot.services.rental import (
+    ensure_utc,
+    expire_expired_rentals,
+    format_money,
+    price_for_hours,
+    rent_hours_bounds,
+)
 from bot.services.user_bans import add_ban, list_bans, normalize_username, remove_ban_by_username
 from bot.time_format import format_local_time
 from bot.states import AddItemStates, AdminBlackoutStates, AdminRentalStates, AdminReservationStates
@@ -57,10 +63,7 @@ async def _finalize_rental_handover(
     settings: Settings,
     acting_user_id: int,
 ) -> tuple[bool, str]:
-    if hours < 1 or hours > 168:
-        return False, "Часы должны быть от 1 до 168."
     now = datetime.now(UTC)
-    end = now + timedelta(hours=hours)
     r = await session.execute(select(Rental).where(Rental.id == rental_id))
     rental = r.scalar_one_or_none()
     if rental is None or rental.state != RentalState.pending_admin.value:
@@ -69,6 +72,10 @@ async def _finalize_rental_handover(
     item = r_item.scalar_one()
     if not admin_manages_item(acting_user_id, item):
         return False, "Эта заявка относится не к вашим вещам."
+    lo, hi = rent_hours_bounds(item)
+    if hours < lo or hours > hi:
+        return False, f"Часы должны быть от {lo} до {hi} (по правилам этой вещи)."
+    end = now + timedelta(hours=hours)
     req_hours = rental.requested_hours
     rental.state = RentalState.active.value
     rental.start_at = now
@@ -1010,14 +1017,15 @@ async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Set
         if not admin_manages_item(query.from_user.id, rental.item):
             await query.answer("Это не ваша вещь.", show_alert=True)
             return
+        lo, hi = rent_hours_bounds(rental.item)
     base = query.message.html_text or query.message.text or ""
     hint = (
-        "\n\n<i>Выберите срок сдачи кнопкой или отправьте число часов "
-        "(от 1 до 168) обычным сообщением в чат.</i>"
+        f"\n\n<i>Выберите срок сдачи кнопкой или отправьте число часов "
+        f"(от {lo} до {hi}) обычным сообщением в чат.</i>"
     )
     await query.message.edit_text(
         base + hint,
-        reply_markup=admin_hours_keyboard(rid),
+        reply_markup=admin_hours_keyboard(rid, lo, hi),
         parse_mode=ParseMode.HTML,
     )
     await state.set_state(AdminRentalStates.waiting_handover_hours)
@@ -1095,10 +1103,20 @@ async def admin_handover_hours_text(message: Message, state: FSMContext, setting
     if (message.text or "").strip().startswith("/"):
         await state.clear()
         return
+    async with db_session.async_session_maker() as session:
+        r0 = await session.execute(
+            select(Rental).options(selectinload(Rental.item)).where(Rental.id == int(rid))
+        )
+        rent0 = r0.scalar_one_or_none()
+        if rent0 is None or rent0.item is None:
+            await state.clear()
+            await message.answer("Заявка не найдена.")
+            return
+        lo, hi = rent_hours_bounds(rent0.item)
     try:
         hours = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Нужно целое число часов от 1 до 168.")
+        await message.answer(f"Нужно целое число часов (для этой вещи: от {lo} до {hi}).")
         return
     async with db_session.async_session_maker() as session:
         ok, text = await _finalize_rental_handover(

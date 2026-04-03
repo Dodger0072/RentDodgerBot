@@ -72,8 +72,11 @@ def admin_rental_decision_keyboard(rental_id: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def admin_hours_keyboard(rental_id: int) -> InlineKeyboardMarkup:
-    hours = [1, 3, 6, 12, 24, 48, 72, 168]
+def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMarkup:
+    preset = [1, 3, 6, 12, 24, 48, 72, 168]
+    hours = [h for h in preset if lo <= h <= hi]
+    if not hours:
+        hours = list(range(lo, hi + 1))
     b = InlineKeyboardBuilder()
     row: list[InlineKeyboardButton] = []
     for h in hours:

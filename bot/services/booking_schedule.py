@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
-from bot.services.rental import MAX_RENT_HOURS, MIN_RENT_HOURS_FREE, MIN_RENT_HOURS_PAID, ensure_utc
+from bot.services.rental import MAX_RENT_HOURS, ensure_utc, rent_hours_bounds
 from bot.time_format import format_local_time
 
 # Интервалы занятости: [start, end) — правая граница не входит (можно стыковать 15:00 ↔15:00).
@@ -197,8 +197,7 @@ def reservation_fits(
 
 
 def rent_lo_hi(item: Item) -> tuple[int, int]:
-    lo = MIN_RENT_HOURS_PAID if item.is_paid else MIN_RENT_HOURS_FREE
-    return lo, MAX_RENT_HOURS
+    return rent_hours_bounds(item)
 
 
 async def validate_new_reservation(
