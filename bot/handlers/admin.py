@@ -14,7 +14,15 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import Settings, is_admin, is_superadmin
-from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation, UserBan
+from bot.db.models import (
+    AdminBlackoutWindow,
+    Item,
+    ItemBlackout,
+    Rental,
+    RentalState,
+    Reservation,
+    UserBan,
+)
 from bot.db import session as db_session
 from bot.keyboards.inline import (
     admin_hours_keyboard,
@@ -891,6 +899,15 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
         n_res = 0
         n_rent = 0
         names: list[str] = []
+        now_bo = datetime.now(UTC)
+        win = AdminBlackoutWindow(
+            owner_user_id=admin_id,
+            start_at=start_at,
+            end_at=end_at,
+            created_at=now_bo,
+        )
+        session.add(win)
+        await session.flush()
         for item in items:
             n_res += await cancel_reservations_hit_by_blackout(
                 session, bot, settings, item, start_at, end_at
@@ -898,7 +915,9 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
             n_rent += await cancel_pending_rentals_hit_by_blackout(
                 session, bot, settings, item, start_at, end_at
             )
-            await add_item_blackout_record(session, item.id, start_at, end_at)
+            await add_item_blackout_record(
+                session, item.id, start_at, end_at, window_id=win.id
+            )
             names.append(item.name)
         await session.commit()
     await state.clear()
@@ -908,6 +927,7 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
     await message.answer(
         f"Окно недоступности добавлено для <b>{len(names)}</b> вещей: {preview}\n"
         f"Интервал: {format_local_time(start_at, settings)} — {format_local_time(end_at, settings)}.\n"
+        f"В <code>/list_blackouts</code> — <b>один</b> id на всё это окно; <code>/delete_blackout</code> снимет его со всех вещей.\n"
         f"Снято броней: {n_res}, заявок на выдачу (ожидают админа): {n_rent}.",
         parse_mode=ParseMode.HTML,
     )
@@ -917,27 +937,55 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
 async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
+    uid = message.from_user.id
     async with db_session.async_session_maker() as session:
-        r = await session.execute(
+        r_w = await session.execute(
+            select(AdminBlackoutWindow)
+            .where(AdminBlackoutWindow.owner_user_id == uid)
+            .options(
+                selectinload(AdminBlackoutWindow.item_blackouts).selectinload(ItemBlackout.item)
+            )
+            .order_by(AdminBlackoutWindow.start_at.desc())
+        )
+        windows = list(r_w.scalars().unique())
+        r_b = await session.execute(
             select(ItemBlackout)
             .options(selectinload(ItemBlackout.item))
-            .order_by(ItemBlackout.start_at.desc()),
+            .where(ItemBlackout.window_id.is_(None))
+            .order_by(ItemBlackout.start_at.desc())
         )
-        rows = list(r.scalars().unique())
+        legacy = list(r_b.scalars().unique())
         await session.commit()
-    rows = [bo for bo in rows if admin_manages_item(message.from_user.id, bo.item)]
-    if not rows:
+    legacy = [bo for bo in legacy if admin_manages_item(uid, bo.item)]
+    if not windows and not legacy:
         await message.answer("Окон недоступности по вашим вещам нет.")
         return
-    lines = []
-    for bo in rows:
+    chunks: list[tuple[datetime, str]] = []
+    for w in windows:
+        nm = sorted({escape(ibo.item.name) if ibo.item else "?" for ibo in w.item_blackouts})
+        nick = ", ".join(nm[:16])
+        if len(nm) > 16:
+            nick += f"… <i>(+{len(nm) - 16})</i>"
+        line = (
+            f"• id <code>{w.id}</code> — <b>общее окно</b> ({len(w.item_blackouts)} вещей)\n"
+            f"  {format_local_time(w.start_at, settings)} — {format_local_time(w.end_at, settings)}\n"
+            f"  <i>{nick}</i>"
+        )
+        chunks.append((w.start_at, line))
+    for bo in legacy:
         it = bo.item
         name = escape(it.name if it else "?")
-        lines.append(
-            f"• id <code>{bo.id}</code> | {name}\n"
+        line = (
+            f"• id <code>{bo.id}</code> — <b>одна вещь</b> | {name}\n"
             f"  {format_local_time(bo.start_at, settings)} — {format_local_time(bo.end_at, settings)}"
         )
-    text = "<b>Окна недоступности выдачи</b>\n\n" + "\n\n".join(lines)
+        chunks.append((bo.start_at, line))
+    chunks.sort(key=lambda x: x[0], reverse=True)
+    lines = [c[1] for c in chunks]
+    text = (
+        "<b>Окна недоступности выдачи</b>\n"
+        "<i>Общее окно — один id; «одна вещь» — старые записи без группы.</i>\n\n" + "\n\n".join(lines)
+    )
     if len(text) > 4000:
         text = text[:3990] + "…"
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -949,14 +997,28 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Использование: /delete_blackout 3 — где 3 это id из /list_blackouts")
+        await message.answer(
+            "Использование: /delete_blackout 5 — id из /list_blackouts "
+            "(для общего окна снимается со всех вещей сразу)."
+        )
         return
     try:
         bid = int(parts[1].strip())
     except ValueError:
         await message.answer("Нужен числовой id.")
         return
+    uid = message.from_user.id
     async with db_session.async_session_maker() as session:
+        w = await session.get(AdminBlackoutWindow, bid)
+        if w is not None:
+            if w.owner_user_id != uid:
+                await session.rollback()
+                await message.answer("Такого общего окна нет или оно создано другим администратором.")
+                return
+            await session.delete(w)
+            await session.commit()
+            await message.answer(f"Общее окно #{bid} удалено со всех вещей.")
+            return
         r = await session.execute(
             select(ItemBlackout)
             .options(selectinload(ItemBlackout.item))
@@ -967,7 +1029,18 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
             await session.rollback()
             await message.answer("Запись не найдена.")
             return
-        if not admin_manages_item(message.from_user.id, bo.item):
+        if bo.window_id is not None:
+            w2 = await session.get(AdminBlackoutWindow, bo.window_id)
+            if w2 is not None and w2.owner_user_id == uid:
+                wid = w2.id
+                await session.delete(w2)
+                await session.commit()
+                await message.answer(f"Общее окно #{wid} удалено со всех вещей.")
+                return
+            await session.rollback()
+            await message.answer("Удаляйте по id общего окна из /list_blackouts.")
+            return
+        if not admin_manages_item(uid, bo.item):
             await session.rollback()
             await message.answer("Это окно на чужой вещи.")
             return

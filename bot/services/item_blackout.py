@@ -137,10 +137,21 @@ async def cancel_pending_rentals_hit_by_blackout(
 
 
 async def add_item_blackout_record(
-    session: AsyncSession, item_id: int, start_at: datetime, end_at: datetime
+    session: AsyncSession,
+    item_id: int,
+    start_at: datetime,
+    end_at: datetime,
+    *,
+    window_id: int | None = None,
 ) -> ItemBlackout:
     now = datetime.now(UTC)
-    bo = ItemBlackout(item_id=item_id, start_at=start_at, end_at=end_at, created_at=now)
+    bo = ItemBlackout(
+        item_id=item_id,
+        start_at=start_at,
+        end_at=end_at,
+        created_at=now,
+        window_id=window_id,
+    )
     session.add(bo)
     await session.flush()
     return bo

@@ -72,6 +72,20 @@ class Item(Base):
     blackouts: Mapped[List["ItemBlackout"]] = relationship(back_populates="item")
 
 
+class AdminBlackoutWindow(Base):
+    """Одно логическое окно «не дома», созданное через /add_blackout сразу на все свои вещи — один id на удаление."""
+
+    __tablename__ = "admin_blackout_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    item_blackouts: Mapped[List["ItemBlackout"]] = relationship(back_populates="window")
+
+
 class ItemBlackout(Base):
     """Окно, когда арендодатель не может выдать конкретную вещь."""
 
@@ -79,11 +93,16 @@ class ItemBlackout(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
+    window_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admin_blackout_windows.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     item: Mapped["Item"] = relationship(back_populates="blackouts")
+    window: Mapped["AdminBlackoutWindow | None"] = relationship(back_populates="item_blackouts")
 
 
 class RentalHandoverStat(Base):

@@ -79,6 +79,20 @@ async def _migrate_sqlite_rental_no_response_penalty(conn) -> None:
         )
 
 
+async def _migrate_sqlite_item_blackout_window(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(item_blackouts)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "window_id" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE item_blackouts ADD COLUMN window_id INTEGER "
+                "REFERENCES admin_blackout_windows(id) ON DELETE CASCADE"
+            )
+        )
+
+
 async def _migrate_sqlite_item_rent_hours(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -101,3 +115,4 @@ async def init_db() -> None:
         await _migrate_sqlite_item_display_order(conn)
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
+        await _migrate_sqlite_item_blackout_window(conn)
