@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from html import escape
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +25,34 @@ def item_notification_recipients(item: Item, settings: Settings) -> list[int]:
     if item.owner_user_id is not None:
         return [int(item.owner_user_id)]
     return sorted(settings.admin_user_ids)
+
+
+async def landlord_contact_hint_html(bot: Bot, item: Item, settings: Settings) -> str:
+    """Короткая HTML-строка: кому в Telegram написать за выдачей вещи (для арендатора)."""
+    if item.owner_user_id is not None:
+        stored = (item.owner_username or "").strip().lstrip("@")
+        if stored:
+            return f"<b>Кому написать за вещью:</b> @{escape(stored)}"
+        try:
+            chat = await bot.get_chat(int(item.owner_user_id))
+            un = getattr(chat, "username", None)
+            if un:
+                u = str(un).strip().lstrip("@")
+                if u:
+                    return f"<b>Кому написать за вещью:</b> @{escape(u)}"
+        except TelegramBadRequest:
+            pass
+        return (
+            f"<b>Владелец вещи</b> в Telegram: id <code>{item.owner_user_id}</code> "
+            "(username в профиле не виден — напишите в известный вам чат команды)."
+        )
+    admins = sorted(settings.admin_usernames)
+    if admins:
+        tags = ", ".join(f"@{escape(a)}" for a in admins)
+        return f"<b>Общая вещь — кому можно написать:</b> {tags}"
+    return (
+        "<i>Вещь без отдельного владельца. Свяжитесь с администраторами через ваш общий канал.</i>"
+    )
 
 
 async def items_owned_by_admin(session: AsyncSession, admin_user_id: int) -> list[Item]:

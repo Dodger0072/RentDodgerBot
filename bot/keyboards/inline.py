@@ -14,18 +14,14 @@ def admin_item_category_keyboard() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def inventory_subcategory_keyboard(*, is_paid: bool) -> InlineKeyboardMarkup:
-    """Второй уровень: тип аренды уже выбран (платная/бесплатная)."""
+def inventory_subcategory_keyboard(
+    *, is_paid: bool, rows: list[tuple[str, str]]
+) -> InlineKeyboardMarkup:
+    """Второй уровень: тип аренды уже выбран; rows — только непустые категории."""
     kind = "paid" if is_paid else "free"
     b = InlineKeyboardBuilder()
-    for slug, label in ITEM_CATEGORIES:
+    for slug, label in rows:
         b.row(InlineKeyboardButton(text=label, callback_data=f"u:grp:{kind}:{slug}"))
-    b.row(
-        InlineKeyboardButton(
-            text="Без категории",
-            callback_data=f"u:grp:{kind}:{UNCATEGORIZED_SLUG}",
-        )
-    )
     b.row(InlineKeyboardButton(text="« Назад", callback_data="u:back"))
     return b.as_markup()
 
@@ -69,6 +65,12 @@ def admin_rental_decision_keyboard(rental_id: int) -> InlineKeyboardMarkup:
     b.row(
         InlineKeyboardButton(text="Вещь сдана", callback_data=f"adm:r:{rental_id}:ok"),
         InlineKeyboardButton(text="Вещь не сдана", callback_data=f"adm:r:{rental_id}:no"),
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="Выдать предупреждение",
+            callback_data=f"adm:r:{rental_id}:warn",
+        )
     )
     return b.as_markup()
 

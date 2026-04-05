@@ -23,11 +23,7 @@ from bot.config import Settings
 from bot.time_format import format_local_time
 from bot.db.models import Item, Rental, RentalState, Reservation
 from bot.db import session as db_session
-from bot.item_categories import (
-    ITEM_CATEGORY_SLUGS,
-    UNCATEGORIZED_SLUG,
-    item_category_label,
-)
+from bot.item_categories import UNCATEGORIZED_SLUG, item_category_label
 from bot.keyboards.inline import (
     category_keyboard,
     confirm_keyboard,
@@ -51,10 +47,13 @@ from bot.services.booking_schedule import (
     point_inside_busy,
     rent_lo_hi,
     reservation_fits,
+    reservation_start_in_past_error,
     validate_new_reservation,
     MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START,
     user_may_cancel_reservation,
 )
+from bot.services.item_order import non_empty_rental_category_menu_rows
+from bot.services.item_owner import landlord_contact_hint_html
 from bot.services.rental import (
     can_take_immediate_rent,
     ensure_utc,
@@ -133,10 +132,14 @@ async def cat_paid(query: CallbackQuery, state: FSMContext, settings: Settings) 
             await session.commit()
             await query.answer("Пока нет вещей в платной аренде", show_alert=True)
             return
+        cat_rows = await non_empty_rental_category_menu_rows(session, is_paid=True)
         await session.commit()
+    if not cat_rows:
+        await query.answer("Каталог временно недоступен", show_alert=True)
+        return
     await query.message.answer(
         "Платная аренда — выберите <b>категорию вещей</b>:",
-        reply_markup=inventory_subcategory_keyboard(is_paid=True),
+        reply_markup=inventory_subcategory_keyboard(is_paid=True, rows=cat_rows),
         parse_mode=ParseMode.HTML,
     )
     await query.answer()
@@ -151,10 +154,14 @@ async def cat_free(query: CallbackQuery, state: FSMContext, settings: Settings) 
             await session.commit()
             await query.answer("Пока нет вещей в бесплатной аренде", show_alert=True)
             return
+        cat_rows = await non_empty_rental_category_menu_rows(session, is_paid=False)
         await session.commit()
+    if not cat_rows:
+        await query.answer("Каталог временно недоступен", show_alert=True)
+        return
     await query.message.answer(
         "Бесплатная аренда — выберите <b>категорию вещей</b>:",
-        reply_markup=inventory_subcategory_keyboard(is_paid=False),
+        reply_markup=inventory_subcategory_keyboard(is_paid=False, rows=cat_rows),
         parse_mode=ParseMode.HTML,
     )
     await query.answer()
@@ -172,8 +179,8 @@ async def cat_then_inventory_group(query: CallbackQuery, state: FSMContext, sett
         await query.answer()
         return
     is_paid = kind == "paid"
-    if slug != UNCATEGORIZED_SLUG and slug not in ITEM_CATEGORY_SLUGS:
-        await query.answer("Неизвестная категория", show_alert=True)
+    if not slug or len(slug) > 48 or ":" in slug:
+        await query.answer("Некорректные данные", show_alert=True)
         return
     async with db_session.async_session_maker() as session:
         q = select(Item).where(Item.is_paid.is_(is_paid))
@@ -427,11 +434,9 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
         )
         return
     now = datetime.now(UTC)
-    if parsed < now:
-        await message.answer(
-            "Начало брони не может быть в прошлом — укажите будущее время.",
-            reply_markup=home_keyboard(),
-        )
+    past_err = reservation_start_in_past_error(parsed, now)
+    if past_err is not None:
+        await message.answer(past_err, reply_markup=home_keyboard())
         return
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
@@ -628,11 +633,13 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
         session.add(rental)
         await session.flush()
         await notify_admins_pending_rental(bot, settings, session, rental, item, total, planned_end)
+        contact_html = await landlord_contact_hint_html(bot, item, settings)
         await session.commit()
     await state.clear()
     await query.message.edit_text(
-        "Заявка отправлена администратору. Ожидайте подтверждения.",
+        "Заявка отправлена администратору. Ожидайте подтверждения.\n\n" + contact_html,
         reply_markup=home_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     await query.answer()
 
@@ -675,6 +682,12 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
             "Ошибка данных. Начните бронь заново.",
             reply_markup=home_keyboard(),
         )
+        return
+    now = datetime.now(UTC)
+    past_err = reservation_start_in_past_error(start_at, now)
+    if past_err is not None:
+        await state.clear()
+        await message.answer(past_err, reply_markup=home_keyboard())
         return
     lo, hi = rent_lo_hi(item)
     max_h = max_hours_from_start(start_at, rr, lo, hi)

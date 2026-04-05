@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from html import escape
 
@@ -16,11 +16,8 @@ from bot.config import Settings
 from bot.db import session as db_session
 from bot.db.models import Rental, RentalState, Reservation
 from bot.services.admin_notify import notify_admins_pending_rental
+from bot.services.item_owner import item_notification_recipients, landlord_contact_hint_html
 from bot.services.rental import ensure_utc, expire_expired_rentals, price_for_hours
-from bot.services.user_discipline import (
-    NO_RESPONSE_AFTER_START_MINUTES,
-    add_warning,
-)
 from bot.time_format import format_local_time
 
 logger = logging.getLogger(__name__)
@@ -32,6 +29,13 @@ _REM_15M_LO = 10 * 60
 _REM_15M_HI = 20 * 60
 
 
+def _renter_line_html(res: Reservation) -> str:
+    un = (res.username or "").strip().lstrip("@")
+    if un:
+        return f"@{escape(un)} (<code>{res.user_id}</code>)"
+    return f"id <code>{res.user_id}</code>"
+
+
 async def process_reservation_reminders(bot: Bot, settings: Settings) -> None:
     now = datetime.now(UTC)
     async with db_session.async_session_maker() as session:
@@ -40,7 +44,9 @@ async def process_reservation_reminders(bot: Bot, settings: Settings) -> None:
             .options(selectinload(Reservation.item))
             .where(
                 (Reservation.notified_before_1h.is_(False))
-                | (Reservation.notified_before_15m.is_(False)),
+                | (Reservation.notified_before_15m.is_(False))
+                | (Reservation.notified_owner_before_1h.is_(False))
+                | (Reservation.notified_owner_before_15m.is_(False)),
             )
         )
         rows = list(q.scalars().unique())
@@ -58,23 +64,57 @@ async def process_reservation_reminders(bot: Bot, settings: Settings) -> None:
             rem_sec = (start - now).total_seconds()
 
             if not res.notified_before_1h and _REM_1H_LO <= rem_sec <= _REM_1H_HI:
+                contact = await landlord_contact_hint_html(bot, item, settings)
                 text = (
                     "⏰ <b>Через час</b> начинается ваша бронь.\n"
                     f"Вещь: <b>{escape(item.name)}</b>\n"
-                    f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}"
+                    f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}\n\n"
+                    f"{contact}"
                 )
                 await _send_reminder(bot, res.user_id, text)
                 res.notified_before_1h = True
                 changed = True
 
             if not res.notified_before_15m and _REM_15M_LO <= rem_sec <= _REM_15M_HI:
+                contact = await landlord_contact_hint_html(bot, item, settings)
                 text = (
                     "⏰ <b>Через 15 минут</b> начинается ваша бронь.\n"
                     f"Вещь: <b>{escape(item.name)}</b>\n"
-                    f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}"
+                    f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}\n\n"
+                    f"{contact}"
                 )
                 await _send_reminder(bot, res.user_id, text)
                 res.notified_before_15m = True
+                changed = True
+
+            if not res.notified_owner_before_1h and _REM_1H_LO <= rem_sec <= _REM_1H_HI:
+                renter = _renter_line_html(res)
+                owner_text = (
+                    "⏰ <b>Через час</b> начинается бронь по вашей вещи.\n"
+                    f"Вещь: <b>{escape(item.name)}</b>\n"
+                    f"Арендатор: {renter}\n"
+                    f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}"
+                )
+                for admin_id in sorted(set(item_notification_recipients(item, settings))):
+                    if admin_id == res.user_id:
+                        continue
+                    await _send_reminder(bot, admin_id, owner_text)
+                res.notified_owner_before_1h = True
+                changed = True
+
+            if not res.notified_owner_before_15m and _REM_15M_LO <= rem_sec <= _REM_15M_HI:
+                renter = _renter_line_html(res)
+                owner_text = (
+                    "⏰ <b>Через 15 минут</b> нужно сдать вещь арендатору.\n"
+                    f"Вещь: <b>{escape(item.name)}</b>\n"
+                    f"Арендатор: {renter}\n"
+                    f"Начало слота: {format_local_time(start, settings)} — {format_local_time(end, settings)}"
+                )
+                for admin_id in sorted(set(item_notification_recipients(item, settings))):
+                    if admin_id == res.user_id:
+                        continue
+                    await _send_reminder(bot, admin_id, owner_text)
+                res.notified_owner_before_15m = True
                 changed = True
 
         if changed:
@@ -161,6 +201,19 @@ async def process_reservation_booking_starts(bot: Bot, settings: Settings) -> No
                 )
             except Exception:
                 logger.exception("notify admins for booking start failed (rental id will still save)")
+            try:
+                contact = await landlord_contact_hint_html(bot, item, settings)
+                user_started = (
+                    "✅ <b>Началось время вашей брони.</b>\n"
+                    f"Вещь: <b>{escape(item.name)}</b>\n"
+                    f"Слот: {format_local_time(start, settings)} — {format_local_time(end, settings)}.\n\n"
+                    f"{contact}\n\n"
+                    "Заявка на выдачу ушла арендодателю в боте — можно дождаться ответа здесь "
+                    "или написать ему в Telegram."
+                )
+                await _send_reminder(bot, rental.user_id, user_started)
+            except Exception:
+                logger.exception("notify user for booking start failed")
             await session.commit()
 
 
@@ -175,51 +228,11 @@ async def _send_reminder(bot: Bot, user_id: int, text: str) -> None:
         logger.exception("Reminder error for %s", user_id)
 
 
-async def process_rental_no_response_warnings(bot: Bot, settings: Settings) -> None:
-    """Пенальти: заявка pending_admin, срок start_at + 15 мин прошёл — 1 предупреждение (раз на заявку)."""
-    now = datetime.now(UTC)
-    async with db_session.async_session_maker() as session:
-        q = await session.execute(
-            select(Rental).where(
-                Rental.state == RentalState.pending_admin.value,
-                Rental.no_response_penalty_applied.is_(False),
-            )
-        )
-        rows = list(q.scalars().all())
-        changed = False
-        for rental in rows:
-            start = ensure_utc(rental.start_at)
-            if start is None:
-                continue
-            if now < start + timedelta(minutes=NO_RESPONSE_AFTER_START_MINUTES):
-                continue
-            rental.no_response_penalty_applied = True
-            changed = True
-            reason = (
-                f"<b>Нет ответа арендодателю</b> в течение {NO_RESPONSE_AFTER_START_MINUTES} мин. "
-                "после начала срока аренды по заявке из бота."
-            )
-            await add_warning(
-                session,
-                user_id=rental.user_id,
-                username=rental.username,
-                reason_html=reason,
-                bot=bot,
-                ban_note=(
-                    "Автоматически: нет ответа арендодателю после начала срока аренды "
-                    f"(заявка rental_id={rental.id})."
-                ),
-            )
-        if changed:
-            await session.commit()
-
-
 async def reservation_reminder_loop(bot: Bot, settings: Settings, interval_sec: float = 45.0) -> None:
     while True:
         try:
             await asyncio.sleep(interval_sec)
             await process_reservation_booking_starts(bot, settings)
-            await process_rental_no_response_warnings(bot, settings)
             await process_reservation_reminders(bot, settings)
         except asyncio.CancelledError:
             break

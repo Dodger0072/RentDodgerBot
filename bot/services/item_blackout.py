@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
-from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
+from bot.db.models import Item, Rental, RentalState, Reservation
 from bot.services.rental import ensure_utc
 from bot.time_format import format_local_time
 
@@ -134,24 +134,3 @@ async def cancel_pending_rentals_hit_by_blackout(
         await session.delete(rental)
         removed += 1
     return removed
-
-
-async def add_item_blackout_record(
-    session: AsyncSession,
-    item_id: int,
-    start_at: datetime,
-    end_at: datetime,
-    *,
-    window_id: int | None = None,
-) -> ItemBlackout:
-    now = datetime.now(UTC)
-    bo = ItemBlackout(
-        item_id=item_id,
-        start_at=start_at,
-        end_at=end_at,
-        created_at=now,
-        window_id=window_id,
-    )
-    session.add(bo)
-    await session.flush()
-    return bo

@@ -16,6 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.config import Settings, is_admin, is_superadmin
 from bot.db.models import (
     AdminBlackoutWindow,
+    BlackoutWindowItem,
     Item,
     ItemBlackout,
     Rental,
@@ -32,7 +33,6 @@ from bot.keyboards.inline import (
 from bot.item_categories import ITEM_CATEGORY_SLUGS, item_category_label
 from bot.services.booking_schedule import parse_booking_start_text
 from bot.services.item_blackout import (
-    add_item_blackout_record,
     cancel_pending_rentals_hit_by_blackout,
     cancel_reservations_hit_by_blackout,
 )
@@ -62,6 +62,7 @@ from bot.services.user_bans import (
 from bot.services.user_discipline import (
     WARNINGS_BAN_THRESHOLD,
     add_warning,
+    clear_warnings_for_user,
     format_warn_reason_for_user,
     list_users_with_warnings,
     record_successful_handover,
@@ -803,6 +804,104 @@ async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
     )
 
 
+@router.message(Command("unwarn_user", "unwarn", "clear_warnings"))
+async def cmd_unwarn_user(message: Message, bot: Bot, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    tokens = (message.text or "").strip().split(maxsplit=1)
+    if len(tokens) < 2:
+        await message.answer(
+            "Использование: <code>/unwarn</code> или <code>/unwarn_user</code> — "
+            "затем <b>@username</b> или числовой <b>Telegram id</b>.\n"
+            "Сбрасывает все предупреждения и счётчик успешных выдач у пользователя "
+            "(блокировку /unban не снимает).\n"
+            "Пример: <code>/unwarn vasya</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    target = tokens[1].strip()
+
+    user_id: int | None = None
+    username_for_row: str | None = None
+
+    if target.isdigit():
+        user_id = int(target)
+        if user_id <= 0:
+            await message.answer("Некорректный id.")
+            return
+    else:
+        uname = normalize_username(target)
+        if not uname:
+            await message.answer("Укажите непустой username (с @ или без).")
+            return
+        try:
+            chat = await bot.get_chat(f"@{uname}")
+            if chat.id and chat.id > 0:
+                user_id = int(chat.id)
+            username_for_row = chat.username or uname
+        except TelegramBadRequest:
+            async with db_session.async_session_maker() as session:
+                user_id = await resolve_user_id_by_username_norm(session, uname)
+            if user_id is None:
+                await message.answer(
+                    "Telegram не отдаёт профиль по @username (для обычных пользователей так бывает), "
+                    "и в базе бота не найдено заявок/броней с этим ником.\n\n"
+                    "Укажите числовой <b>id</b> пользователя (Настройки Telegram) "
+                    "или попросите его снова написать боту.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            username_for_row = uname
+
+    if user_id is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    async with db_session.async_session_maker() as session:
+        banned = await is_user_banned(session, user_id=user_id, username=username_for_row)
+        code, prev = await clear_warnings_for_user(
+            session, user_id=user_id, username=username_for_row
+        )
+        await session.commit()
+
+    if code == "none":
+        await message.answer(
+            f"У пользователя <code>{user_id}</code> не было записи о предупреждениях.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if code == "already":
+        await message.answer(
+            f"У пользователя <code>{user_id}</code> предупреждений уже не было.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ <b>Администратор обнулил ваши предупреждения</b> "
+            f"(было снято: <b>{prev}</b> из {WARNINGS_BAN_THRESHOLD}). "
+            "Счётчик успешных выдач для автоматического сброса тоже обнулён.",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramForbiddenError:
+        pass
+    except TelegramBadRequest:
+        pass
+
+    extra = ""
+    if banned:
+        extra = (
+            " Пользователь всё ещё в <b>бане</b> — при необходимости снимите: "
+            "<code>/unban</code>."
+        )
+    await message.answer(
+        f"Готово. С пользователя <code>{user_id}</code> снято <b>{prev}</b> предупреждений.{extra}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(Command("list_warnings"))
 async def cmd_list_warnings(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
@@ -915,9 +1014,7 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
             n_rent += await cancel_pending_rentals_hit_by_blackout(
                 session, bot, settings, item, start_at, end_at
             )
-            await add_item_blackout_record(
-                session, item.id, start_at, end_at, window_id=win.id
-            )
+            session.add(BlackoutWindowItem(window_id=win.id, item_id=item.id))
             names.append(item.name)
         await session.commit()
     await state.clear()
@@ -938,36 +1035,43 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
     uid = message.from_user.id
+    now = datetime.now(UTC)
     async with db_session.async_session_maker() as session:
         r_w = await session.execute(
             select(AdminBlackoutWindow)
-            .where(AdminBlackoutWindow.owner_user_id == uid)
-            .options(
-                selectinload(AdminBlackoutWindow.item_blackouts).selectinload(ItemBlackout.item)
+            .where(
+                AdminBlackoutWindow.owner_user_id == uid,
+                AdminBlackoutWindow.end_at > now,
             )
-            .order_by(AdminBlackoutWindow.start_at.desc())
+            .options(
+                selectinload(AdminBlackoutWindow.window_items).selectinload(BlackoutWindowItem.item)
+            )
+            .order_by(AdminBlackoutWindow.start_at.asc())
         )
         windows = list(r_w.scalars().unique())
         r_b = await session.execute(
             select(ItemBlackout)
             .options(selectinload(ItemBlackout.item))
-            .where(ItemBlackout.window_id.is_(None))
-            .order_by(ItemBlackout.start_at.desc())
+            .where(
+                ItemBlackout.window_id.is_(None),
+                ItemBlackout.end_at > now,
+            )
+            .order_by(ItemBlackout.start_at.asc())
         )
         legacy = list(r_b.scalars().unique())
         await session.commit()
     legacy = [bo for bo in legacy if admin_manages_item(uid, bo.item)]
     if not windows and not legacy:
-        await message.answer("Окон недоступности по вашим вещам нет.")
+        await message.answer("Предстоящих окон недоступности по вашим вещам нет.")
         return
     chunks: list[tuple[datetime, str]] = []
     for w in windows:
-        nm = sorted({escape(ibo.item.name) if ibo.item else "?" for ibo in w.item_blackouts})
+        nm = sorted({escape(li.item.name) if li.item else "?" for li in w.window_items})
         nick = ", ".join(nm[:16])
         if len(nm) > 16:
             nick += f"… <i>(+{len(nm) - 16})</i>"
         line = (
-            f"• id <code>{w.id}</code> — <b>общее окно</b> ({len(w.item_blackouts)} вещей)\n"
+            f"• id <code>{w.id}</code> — <b>общее окно</b> ({len(w.window_items)} вещей)\n"
             f"  {format_local_time(w.start_at, settings)} — {format_local_time(w.end_at, settings)}\n"
             f"  <i>{nick}</i>"
         )
@@ -980,11 +1084,12 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
             f"  {format_local_time(bo.start_at, settings)} — {format_local_time(bo.end_at, settings)}"
         )
         chunks.append((bo.start_at, line))
-    chunks.sort(key=lambda x: x[0], reverse=True)
+    chunks.sort(key=lambda x: x[0])
     lines = [c[1] for c in chunks]
     text = (
-        "<b>Окна недоступности выдачи</b>\n"
-        "<i>Общее окно — один id; «одна вещь» — старые записи без группы.</i>\n\n" + "\n\n".join(lines)
+        "<b>Предстоящие окна недоступности выдачи</b>\n"
+        "<i>Окно из /add_blackout — одна строка и один id на все вещи; «одна вещь» — только старые записи. Прошедшие не показываются.</i>\n\n"
+        + "\n\n".join(lines)
     )
     if len(text) > 4000:
         text = text[:3990] + "…"
@@ -1432,6 +1537,62 @@ async def admin_rental_reject(query: CallbackQuery, state: FSMContext, settings:
         await session.commit()
     await query.message.edit_text("Отмечено: вещь не сдана. Заявка снята.")
     await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:r:(\d+):warn$"))
+async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    rid = int(query.data.split(":")[2])
+    try:
+        async with db_session.async_session_maker() as session:
+            r = await session.execute(
+                select(Rental).options(selectinload(Rental.item)).where(Rental.id == rid)
+            )
+            rental = r.scalar_one_or_none()
+            if rental is None or rental.state != RentalState.pending_admin.value:
+                await query.answer("Заявка не найдена или уже обработана", show_alert=True)
+                return
+            if not admin_manages_item(query.from_user.id, rental.item):
+                await query.answer("Это не ваша вещь.", show_alert=True)
+                return
+            if await is_user_banned(session, user_id=rental.user_id, username=rental.username):
+                await session.rollback()
+                await query.answer("Пользователь уже в списке блокировки.", show_alert=True)
+                return
+            reason_plain = (
+                "Несвоевременный контакт или нарушение дисциплины по заявке на аренду "
+                "(решение администратора)."
+            )
+            admin_note = (
+                f"Кнопка «Выдать предупреждение» в заявке rental_id={rid}, "
+                f"админ id {query.from_user.id}"
+            )
+            reason_html = (
+                "<b>Предупреждение от администратора.</b>\n"
+                f"{format_warn_reason_for_user(reason_plain)}"
+            )
+            cnt, banned = await add_warning(
+                session,
+                user_id=rental.user_id,
+                username=rental.username,
+                reason_html=reason_html,
+                bot=bot,
+                ban_note=admin_note,
+            )
+            await session.commit()
+    except IntegrityError:
+        await query.answer(
+            "Не удалось сохранить (например, дубликат бана). Проверьте /list_bans.",
+            show_alert=True,
+        )
+        return
+    extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD})." if banned else ""
+    await query.answer(
+        f"Предупреждение выдано. Сейчас у пользователя {cnt}/{WARNINGS_BAN_THRESHOLD}.{extra}",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):ok$"))

@@ -70,6 +70,9 @@ class Item(Base):
     rentals: Mapped[List["Rental"]] = relationship(back_populates="item")
     reservations: Mapped[List["Reservation"]] = relationship(back_populates="item")
     blackouts: Mapped[List["ItemBlackout"]] = relationship(back_populates="item")
+    blackout_window_links: Mapped[List["BlackoutWindowItem"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan"
+    )
 
 
 class AdminBlackoutWindow(Base):
@@ -83,11 +86,33 @@ class AdminBlackoutWindow(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    item_blackouts: Mapped[List["ItemBlackout"]] = relationship(back_populates="window")
+    window_items: Mapped[List["BlackoutWindowItem"]] = relationship(
+        back_populates="window", cascade="all, delete-orphan"
+    )
+
+
+class BlackoutWindowItem(Base):
+    """Какие вещи входят в общее окно /add_blackout (одно окно — одна запись в списке, одно удаление)."""
+
+    __tablename__ = "blackout_window_items"
+
+    window_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("admin_blackout_windows.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    window: Mapped["AdminBlackoutWindow"] = relationship(back_populates="window_items")
+    item: Mapped["Item"] = relationship(back_populates="blackout_window_links")
 
 
 class ItemBlackout(Base):
-    """Окно, когда арендодатель не может выдать конкретную вещь."""
+    """Окно на одну вещь (legacy без общего окна). Общие окна — только blackout_window_items + admin_blackout_windows."""
 
     __tablename__ = "item_blackouts"
 
@@ -102,7 +127,6 @@ class ItemBlackout(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     item: Mapped["Item"] = relationship(back_populates="blackouts")
-    window: Mapped["AdminBlackoutWindow | None"] = relationship(back_populates="item_blackouts")
 
 
 class RentalHandoverStat(Base):
@@ -152,5 +176,7 @@ class Reservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notified_before_1h: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notified_before_15m: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notified_owner_before_1h: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notified_owner_before_15m: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     item: Mapped["Item"] = relationship(back_populates="reservations")

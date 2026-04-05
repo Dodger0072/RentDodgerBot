@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
+from bot.db.models import AdminBlackoutWindow, BlackoutWindowItem, Item, ItemBlackout, Rental, RentalState, Reservation
 from bot.services.rental import MAX_RENT_HOURS, ensure_utc, rent_hours_bounds
 from bot.time_format import format_local_time
 
@@ -75,16 +76,45 @@ async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> lis
     return busy
 
 
-async def load_blackout_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
-    out: list[tuple[datetime, datetime]] = []
-    r_bo = await session.execute(
-        select(ItemBlackout).where(ItemBlackout.item_id == item_id).order_by(ItemBlackout.start_at)
+def _append_blackout_interval(
+    out: dict[int, list[tuple[datetime, datetime]]], item_id: int, start_at, end_at
+) -> None:
+    s, e = ensure_utc(start_at), ensure_utc(end_at)
+    if s is not None and e is not None and e > s:
+        out[item_id].append((s, e))
+
+
+async def load_blackout_intervals_for_item_ids(
+    session: AsyncSession, item_ids: list[int]
+) -> dict[int, list[tuple[datetime, datetime]]]:
+    """Интервалы blackout: общие окна (/add_blackout) через blackout_window_items + legacy по одной вещи."""
+    out: dict[int, list[tuple[datetime, datetime]]] = defaultdict(list)
+    if not item_ids:
+        return {}
+    ids = list({int(x) for x in item_ids})
+    r_w = await session.execute(
+        select(BlackoutWindowItem.item_id, AdminBlackoutWindow.start_at, AdminBlackoutWindow.end_at)
+        .select_from(BlackoutWindowItem)
+        .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
+        .where(BlackoutWindowItem.item_id.in_(ids))
     )
-    for bo in r_bo.scalars():
-        s, e = ensure_utc(bo.start_at), ensure_utc(bo.end_at)
-        if s is not None and e is not None and e > s:
-            out.append((s, e))
-    return out
+    for iid, sa, ea in r_w.all():
+        _append_blackout_interval(out, int(iid), sa, ea)
+    r_leg = await session.execute(
+        select(ItemBlackout.item_id, ItemBlackout.start_at, ItemBlackout.end_at).where(
+            ItemBlackout.item_id.in_(ids),
+            ItemBlackout.window_id.is_(None),
+        )
+    )
+    for iid, sa, ea in r_leg.all():
+        _append_blackout_interval(out, int(iid), sa, ea)
+    return dict(out)
+
+
+async def load_blackout_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
+    m = await load_blackout_intervals_for_item_ids(session, [item_id])
+    iv = m.get(item_id, [])
+    return sorted(iv, key=lambda t: t[0])
 
 
 async def load_busy_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
@@ -200,6 +230,17 @@ def parse_booking_start_text(text: str, settings: Settings) -> datetime | None:
     except ValueError:
         return None
     return local.astimezone(UTC)
+
+
+def reservation_start_in_past_error(start: datetime, now: datetime) -> str | None:
+    """None — начало не в прошлом; иначе короткий текст ошибки для пользователя."""
+    s = ensure_utc(start)
+    now_u = ensure_utc(now) or datetime.now(UTC)
+    if s is None:
+        return "Некорректное время начала."
+    if s < now_u:
+        return "Начало брони не может быть в прошлом — укажите будущее время."
+    return None
 
 
 def reservation_fits(
@@ -347,17 +388,22 @@ async def format_user_booking_availability_block(
         nonlocal lines
         if len(lines) >= _AVAIL_UI_MAX_LINES:
             return
+        sa_u = ensure_utc(sa)
+        if sa_u is None:
+            return
+        if sa_u < now_u:
+            sa_u = now_u
         # Перед чужой бронью/арендой нужно уложить минимум lo ч; окно «не дома»
         # ограничивает только момент начала — бронь может пересекаться с ним дальше.
         if _right_edge_is_rr_start(se):
             latest = se - timedelta(hours=lo)
         else:
             latest = se - timedelta(minutes=1)
-        if latest < sa:
+        if latest < sa_u:
             return
         cap_txt = _segment_cap_explanation(se, rr, bo, settings)
         lines.append(
-            f"• с <b>{format_local_time(sa, settings)}</b> до <b>{format_local_time(latest, settings)}</b>\n"
+            f"• с <b>{format_local_time(sa_u, settings)}</b> до <b>{format_local_time(latest, settings)}</b>\n"
             f"  {cap_txt}"
         )
 
@@ -365,8 +411,13 @@ async def format_user_booking_availability_block(
         nonlocal lines
         if len(lines) >= _AVAIL_UI_MAX_LINES:
             return
+        sa_u = ensure_utc(sa)
+        if sa_u is None:
+            return
+        if sa_u < now_u:
+            sa_u = now_u
         lines.append(
-            f"• с <b>{format_local_time(sa, settings)}</b>\n"
+            f"• с <b>{format_local_time(sa_u, settings)}</b>\n"
             f"  Нет ближайшей брони в очереди; длительность {lo}–{hi} ч "
             f"(не дольше {MAX_RENT_HOURS} ч подряд)."
         )
@@ -393,12 +444,6 @@ async def format_user_booking_availability_block(
             if near_horizon:
                 add_open(sa)
             else:
-                if _right_edge_is_rr_start(se):
-                    latest = se - timedelta(hours=lo)
-                else:
-                    latest = se - timedelta(minutes=1)
-                if latest < sa:
-                    continue
                 add_finite(sa, se)
 
     if not lines:
@@ -434,8 +479,9 @@ async def validate_new_reservation(
     s, e = ensure_utc(start), ensure_utc(end)
     if s is None or e is None or e <= s:
         return "Некорректный интервал брони."
-    if s < now_u:
-        return "Начало брони не может быть в прошлом."
+    past_err = reservation_start_in_past_error(s, now_u)
+    if past_err is not None:
+        return past_err
     r_pend = await session.execute(
         select(Rental.id).where(
             Rental.item_id == item_id,

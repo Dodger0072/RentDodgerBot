@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from sqlalchemy import text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.config import Settings
-from bot.db.models import Base
+from bot.db.models import Base, BlackoutWindowItem, ItemBlackout
 
 engine = None
 async_session_maker: async_sessionmaker[AsyncSession] | None = None
@@ -31,6 +31,18 @@ async def _migrate_sqlite_reservation_columns(conn) -> None:
         await conn.execute(
             text(
                 "ALTER TABLE reservations ADD COLUMN notified_before_15m BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    if "notified_owner_before_1h" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE reservations ADD COLUMN notified_owner_before_1h BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    if "notified_owner_before_15m" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE reservations ADD COLUMN notified_owner_before_15m BOOLEAN NOT NULL DEFAULT 0"
             )
         )
 
@@ -93,6 +105,26 @@ async def _migrate_sqlite_item_blackout_window(conn) -> None:
         )
 
 
+async def migrate_blackout_window_links(session: AsyncSession) -> None:
+    """Переносит связь общего окна из дублей item_blackouts в blackout_window_items (одно окно — без N строк в списке)."""
+    r = await session.execute(select(ItemBlackout).where(ItemBlackout.window_id.is_not(None)))
+    rows = list(r.scalars().unique())
+    if not rows:
+        return
+    seen: set[tuple[int, int]] = set()
+    for bo in rows:
+        wid = bo.window_id
+        if wid is None:
+            continue
+        key = (int(wid), int(bo.item_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        session.add(BlackoutWindowItem(window_id=key[0], item_id=key[1]))
+    await session.flush()
+    await session.execute(delete(ItemBlackout).where(ItemBlackout.window_id.is_not(None)))
+
+
 async def _migrate_sqlite_item_rent_hours(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -116,3 +148,8 @@ async def init_db() -> None:
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
         await _migrate_sqlite_item_blackout_window(conn)
+
+    if async_session_maker is not None:
+        async with async_session_maker() as session:
+            async with session.begin():
+                await migrate_blackout_window_links(session)

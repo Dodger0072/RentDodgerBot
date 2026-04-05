@@ -13,7 +13,8 @@ from bot.services.user_bans import add_ban, is_user_banned, normalize_username
 
 WARNINGS_BAN_THRESHOLD = 3
 SUCCESSFUL_HANDOVERS_CLEAR_WARNINGS = 3
-NO_RESPONSE_AFTER_START_MINUTES = 15
+# Срок, о котором предупреждают пользователя в правилах (фактическая выдача — вручную арендодателем в боте).
+RESPONSE_TO_LANDLORD_DEADLINE_MINUTES = 15
 
 
 def discipline_username_norm(user_id: int, username: str | None) -> str:
@@ -44,6 +45,33 @@ async def get_or_create_discipline(
     return row
 
 
+async def clear_warnings_for_user(
+    session: AsyncSession, *, user_id: int, username: str | None
+) -> tuple[str, int]:
+    """Обнуляет предупреждения и счётчик успешных выдач.
+
+    Возвращает (код, число):
+    - ``("none", 0)`` — записи дисциплины не было;
+    - ``("already", 0)`` — запись есть, предупреждений уже не было;
+    - ``("cleared", n)`` — снято было ``n`` предупреждений (n > 0).
+    """
+    r = await session.execute(
+        select(UserRentalDiscipline).where(UserRentalDiscipline.user_id == user_id)
+    )
+    row = r.scalar_one_or_none()
+    if row is None:
+        return "none", 0
+    if username:
+        row.username_norm = discipline_username_norm(user_id, username)
+    prev = int(row.warnings)
+    if prev == 0:
+        return "already", 0
+    row.warnings = 0
+    row.successful_handovers = 0
+    await session.flush()
+    return "cleared", prev
+
+
 async def warnings_count_for_user(session: AsyncSession, user_id: int) -> int:
     r = await session.execute(
         select(UserRentalDiscipline.warnings).where(UserRentalDiscipline.user_id == user_id)
@@ -60,9 +88,9 @@ async def near_ban_notice_for_user(session: AsyncSession, user_id: int) -> str:
     return (
         "\n\n🔔 <b>Обратите внимание:</b> у вас уже "
         f"<b>{n} из {WARNINGS_BAN_THRESHOLD}</b> предупреждений.\n"
-        "Если вы ещё раз не возьмёте вещь в забронированное время или не ответите арендодателю "
-        f"в срок (см. правила брони, {NO_RESPONSE_AFTER_START_MINUTES} мин. после начала), "
-        "доступ к боту будет <b>заблокирован</b>."
+        "Если вы ещё раз не ответите арендодателю в течение "
+        f"<b>{RESPONSE_TO_LANDLORD_DEADLINE_MINUTES} минут</b> после начала срока аренды и "
+        "арендодатель выдаст предупреждение, доступ к боту будет <b>заблокирован</b>."
     )
 
 
@@ -135,9 +163,10 @@ async def add_warning(
 
 
 BOOKING_RULES_USER_HTML = (
-    "⚠️ <b>Важно.</b> Если вы забронируете вещь и в течение "
-    f"<b>{NO_RESPONSE_AFTER_START_MINUTES} минут</b> после начала срока аренды не ответите "
-    "арендодателю на сообщение в Telegram, вы получите <b>1 предупреждение</b>.\n\n"
+    "⚠️ <b>Важно.</b> Если в течение "
+    f"<b>{RESPONSE_TO_LANDLORD_DEADLINE_MINUTES} минут</b> после начала срока аренды "
+    "ответа арендодателю не будет, <b>арендодатель</b> может выдать вам "
+    "<b>предупреждение</b> (через бота).\n\n"
     f"<b>{WARNINGS_BAN_THRESHOLD} предупреждения</b> — запрет доступа к боту и аренде.\n\n"
     f"Предупреждения снимаются после <b>{SUCCESSFUL_HANDOVERS_CLEAR_WARNINGS}</b> успешных "
     "выдач в аренду (когда арендодатель подтвердил сдачу)."

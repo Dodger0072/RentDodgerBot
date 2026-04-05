@@ -111,16 +111,27 @@ class ItemStatus:
     blackout_until: datetime | None = None
 
 
-def blackout_max_end_covering_now(
-    blackouts: list[ItemBlackout], ref_now: datetime
+def blackout_max_end_covering_now_intervals(
+    intervals: list[tuple[datetime, datetime]], ref_now: datetime
 ) -> datetime | None:
     now_u = ensure_utc(ref_now) or datetime.now(UTC)
     ends: list[datetime] = []
-    for bo in blackouts:
-        s, e = ensure_utc(bo.start_at), ensure_utc(bo.end_at)
+    for bs, be in intervals:
+        s, e = ensure_utc(bs), ensure_utc(be)
         if s is not None and e is not None and s <= now_u < e:
             ends.append(e)
     return max(ends) if ends else None
+
+
+def blackout_max_end_covering_now(
+    blackouts: list[ItemBlackout], ref_now: datetime
+) -> datetime | None:
+    intervals: list[tuple[datetime, datetime]] = []
+    for bo in blackouts:
+        s, e = ensure_utc(bo.start_at), ensure_utc(bo.end_at)
+        if s is not None and e is not None and e > s:
+            intervals.append((s, e))
+    return blackout_max_end_covering_now_intervals(intervals, ref_now)
 
 
 def item_now_in_item_blackout(blackouts: list[ItemBlackout], ref_now: datetime) -> bool:
@@ -220,12 +231,13 @@ async def items_availability_batch(
     for row in r_res.scalars():
         res_by[row.item_id].append(row)
 
-    r_bo = await session.execute(select(ItemBlackout).where(ItemBlackout.item_id.in_(item_ids)))
-    bo_by: dict[int, list[ItemBlackout]] = defaultdict(list)
-    for row in r_bo.scalars():
-        bo_by[row.item_id].append(row)
+    from bot.services.booking_schedule import (
+        load_blackout_intervals_for_item_ids,
+        load_rr_busy_intervals_utc,
+        next_busy_start_after,
+    )
 
-    from bot.services.booking_schedule import load_rr_busy_intervals_utc, next_busy_start_after
+    bo_by = await load_blackout_intervals_for_item_ids(session, item_ids)
 
     r_items = await session.execute(select(Item).where(Item.id.in_(item_ids)))
     items_map: dict[int, Item] = {it.id: it for it in r_items.scalars().all()}
@@ -251,7 +263,7 @@ async def items_availability_batch(
         res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
 
         bo_list = bo_by.get(iid, [])
-        bu = blackout_max_end_covering_now(bo_list, ref_now)
+        bu = blackout_max_end_covering_now_intervals(bo_list, ref_now)
         in_bo = bu is not None
 
         busy = await load_rr_busy_intervals_utc(session, iid)
@@ -357,9 +369,11 @@ async def user_facing_status(session: AsyncSession, item_id: int) -> ItemStatus 
         active = r
         break
 
-    r_bo = await session.execute(select(ItemBlackout).where(ItemBlackout.item_id == item_id))
-    blackouts = list(r_bo.scalars().all())
-    bu = blackout_max_end_covering_now(blackouts, now)
+    from bot.services.booking_schedule import load_blackout_intervals_for_item_ids
+
+    bo_map = await load_blackout_intervals_for_item_ids(session, [item_id])
+    blackouts = bo_map.get(item_id, [])
+    bu = blackout_max_end_covering_now_intervals(blackouts, now)
     in_bo = bu is not None
 
     res_cov = reservation_covering_now(reservations, now)

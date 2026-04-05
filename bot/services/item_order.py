@@ -4,6 +4,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Item
+from bot.item_categories import ITEM_CATEGORIES, UNCATEGORIZED_SLUG, item_category_label
 from bot.services.item_owner import admin_manages_item
 
 
@@ -14,6 +15,48 @@ def _group_clause(*, is_paid: bool, item_category: str | None):
     else:
         parts.append(Item.item_category == item_category.strip())
     return and_(*parts)
+
+
+def _uncategorized_db_key(k: object) -> bool:
+    return k is None or (isinstance(k, str) and not str(k).strip())
+
+
+async def non_empty_rental_category_menu_rows(
+    session: AsyncSession, *, is_paid: bool
+) -> list[tuple[str, str]]:
+    """Пары (slug для callback u:grp, подпись кнопки) — только категории, где есть вещи."""
+    r = await session.execute(
+        select(Item.item_category, func.count(Item.id))
+        .where(Item.is_paid.is_(is_paid))
+        .group_by(Item.item_category)
+    )
+    counts: dict[object, int] = {}
+    for cat, cnt in r.all():
+        counts[cat] = int(cnt)
+
+    out: list[tuple[str, str]] = []
+    known_slugs = {s for s, _ in ITEM_CATEGORIES}
+    for slug, label in ITEM_CATEGORIES:
+        if counts.get(slug, 0) > 0:
+            out.append((slug, label))
+
+    uncat = sum(cnt for k, cnt in counts.items() if _uncategorized_db_key(k))
+    if uncat > 0:
+        out.append((UNCATEGORIZED_SLUG, "Без категории"))
+
+    extra: list[tuple[str, str]] = []
+    for k, cnt in counts.items():
+        if cnt <= 0 or _uncategorized_db_key(k):
+            continue
+        sk = str(k).strip()
+        if sk in known_slugs:
+            continue
+        if len(sk) > 48 or ":" in sk:
+            continue
+        extra.append((sk, item_category_label(sk)))
+    extra.sort(key=lambda x: x[1].casefold())
+    out.extend(extra)
+    return out
 
 
 async def next_display_order_for_group(
