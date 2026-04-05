@@ -39,8 +39,10 @@ class UserBookStates(StatesGroup):
 
 
 class AdminRentalStates(StatesGroup):
-    """После «Вещь сдана» — ждём срок в часах (кнопка или текст)."""
+    """«Вещь сдана» — ждём срок; «не сдана» — опционально текст причины для пользователя."""
+
     waiting_handover_hours = State()
+    waiting_no_handover_reason = State()
 
 
 class AdminReservationStates(StatesGroup):

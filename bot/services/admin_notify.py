@@ -12,6 +12,7 @@ from bot.db.models import Item, Rental, Reservation
 from bot.keyboards.inline import admin_rental_decision_keyboard
 from bot.services.item_owner import item_notification_recipients
 from bot.services.rental import format_money
+from bot.services.user_discipline import WARNINGS_BAN_THRESHOLD
 from bot.time_format import format_local_time
 
 
@@ -114,5 +115,59 @@ async def notify_admins_user_cancelled_reservation(
     for admin_id in recipients:
         try:
             await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            continue
+
+
+def _admin_tag_html(user_id: int, username: str | None) -> str:
+    u = (username or "").strip().lstrip("@")
+    if u:
+        return f"@{escape(u)}"
+    return f"id <code>{user_id}</code>"
+
+
+def _ban_arg_plain(user_id: int, username: str | None) -> str:
+    u = (username or "").strip().lstrip("@")
+    return u if u else str(user_id)
+
+
+async def notify_superadmins_discipline_warning(
+    bot: Bot,
+    settings: Settings,
+    *,
+    issuer_user_id: int,
+    issuer_username: str | None,
+    target_user_id: int,
+    target_username: str | None,
+    warnings_count: int,
+    reason_plain: str,
+    at_threshold_without_ban: bool,
+) -> None:
+    """Обычный админ выдал предупреждение — уведомить всех суперадминов (если роли заданы в .env)."""
+    if not settings.superadmin_user_ids:
+        return
+    issuer = _admin_tag_html(issuer_user_id, issuer_username)
+    target = _admin_tag_html(target_user_id, target_username)
+    reason = escape((reason_plain or "").strip()[:500] or "—")
+    extra = ""
+    if at_threshold_without_ban:
+        ban_arg = escape(_ban_arg_plain(target_user_id, target_username))
+        extra = (
+            f"\n\n⚠️ У пользователя уже <b>{WARNINGS_BAN_THRESHOLD}</b> предупреждений; "
+            "автобан не применён (не суперадмин). Забанить вручную: "
+            f"<code>/ban {ban_arg}</code>"
+        )
+    text = (
+        "📋 <b>Предупреждение арендатору</b>\n"
+        f"Выдал: {issuer} (id <code>{issuer_user_id}</code>)\n"
+        f"Кому: {target} (id <code>{target_user_id}</code>)\n"
+        f"Сейчас предупреждений: <b>{warnings_count}</b> из "
+        f"<b>{WARNINGS_BAN_THRESHOLD}</b>\n"
+        f"<b>Комментарий:</b> {reason}"
+        f"{extra}"
+    )
+    for su_id in sorted(settings.superadmin_user_ids):
+        try:
+            await bot.send_message(su_id, text, parse_mode=ParseMode.HTML)
         except Exception:
             continue

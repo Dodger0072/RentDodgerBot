@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import RentalHandoverStat
+from bot.db.models import Item, RentalHandoverStat
 
 
 @dataclass(frozen=True)
@@ -35,27 +35,64 @@ def _utc_range_today_week_month(settings: Settings, ref_utc: datetime | None = N
     return today_start, week_start, month_start
 
 
-async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> RentalStatsSnapshot:
+def _stats_rows_for_admin(admin_user_id: int):
+    """Строки статистики админа: явный подтвердивший или старая запись без поля — по владельцу вещи."""
+    uid = int(admin_user_id)
+    return or_(
+        RentalHandoverStat.handed_over_by_user_id == uid,
+        and_(
+            RentalHandoverStat.handed_over_by_user_id.is_(None),
+            Item.owner_user_id == uid,
+        ),
+    )
+
+
+async def fetch_rental_stats(
+    session: AsyncSession, settings: Settings, *, admin_user_id: int
+) -> RentalStatsSnapshot:
     today_start, week_start, month_start = _utc_range_today_week_month(settings)
     now_utc = datetime.now(UTC)
+    scope = _stats_rows_for_admin(admin_user_id)
 
-    total = await session.scalar(select(func.coalesce(func.sum(RentalHandoverStat.amount), 0)))
-    cnt = await session.scalar(select(func.count()).select_from(RentalHandoverStat))
+    total = await session.scalar(
+        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0))
+        .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
+        .where(scope)
+    )
+    cnt = await session.scalar(
+        select(func.count())
+        .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
+        .where(scope)
+    )
 
     earned_today = await session.scalar(
-        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0)).where(
+        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0))
+        .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
+        .where(
+            scope,
             RentalHandoverStat.handed_over_at >= today_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
     )
     earned_week = await session.scalar(
-        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0)).where(
+        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0))
+        .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
+        .where(
+            scope,
             RentalHandoverStat.handed_over_at >= week_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
     )
     earned_month = await session.scalar(
-        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0)).where(
+        select(func.coalesce(func.sum(RentalHandoverStat.amount), 0))
+        .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
+        .where(
+            scope,
             RentalHandoverStat.handed_over_at >= month_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -64,7 +101,9 @@ async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> Renta
     cnt_today = await session.scalar(
         select(func.count())
         .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
+            scope,
             RentalHandoverStat.handed_over_at >= today_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -72,7 +111,9 @@ async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> Renta
     cnt_week = await session.scalar(
         select(func.count())
         .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
+            scope,
             RentalHandoverStat.handed_over_at >= week_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -80,7 +121,9 @@ async def fetch_rental_stats(session: AsyncSession, settings: Settings) -> Renta
     cnt_month = await session.scalar(
         select(func.count())
         .select_from(RentalHandoverStat)
+        .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
+            scope,
             RentalHandoverStat.handed_over_at >= month_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -113,10 +156,12 @@ def record_handover_stat(
     item_id: int,
     amount: Decimal,
     handed_over_at: datetime,
+    handed_over_by_user_id: int,
 ) -> None:
     session.add(
         RentalHandoverStat(
             item_id=item_id,
+            handed_over_by_user_id=int(handed_over_by_user_id),
             amount=amount,
             handed_over_at=handed_over_at,
         )

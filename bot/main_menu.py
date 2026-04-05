@@ -33,7 +33,7 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
         extra = (
             "\n\nАдмин: /add_item — добавить вещь, /list_items, /edit_item id, /item_order id позиция, /delete_item id; "
             "/bookings, /add_blackout; /list_blackouts, /delete_blackout id; "
-            "/ban @name [причина], /unban @name, /list_bans."
+            "/warn, /list_bans; бан/разбан — только суперадмин (если задан SUPERADMIN_USER_IDS)."
         )
     await message.answer(
         _RENTAL_TYPES_INFO + extra,

@@ -112,13 +112,15 @@ async def add_warning(
     reason_html: str,
     bot: Bot | None,
     ban_note: str,
+    apply_auto_ban: bool = True,
 ) -> tuple[int, bool]:
-    """Вернёт (число предупреждений после начисления, забанен ли сейчас)."""
+    """Вернёт (число предупреждений после начисления, забанен ли сейчас в БД)."""
     if await is_user_banned(session, user_id=user_id, username=username):
         return 0, True
     d = await get_or_create_discipline(session, user_id, username)
     if d.warnings >= WARNINGS_BAN_THRESHOLD:
-        return d.warnings, True
+        banned_now = await is_user_banned(session, user_id=user_id, username=username)
+        return d.warnings, banned_now
     d.warnings += 1
     await session.flush()
     count = d.warnings
@@ -140,19 +142,32 @@ async def add_warning(
 
     banned = False
     if count >= WARNINGS_BAN_THRESHOLD:
-        unorm = discipline_username_norm(user_id, username)
-        await add_ban(
-            session,
-            username_norm=unorm,
-            user_id=user_id,
-            note=ban_note[:1950],
-        )
-        banned = True
-        if bot:
+        if apply_auto_ban:
+            unorm = discipline_username_norm(user_id, username)
+            await add_ban(
+                session,
+                username_norm=unorm,
+                user_id=user_id,
+                note=ban_note[:1950],
+            )
+            banned = True
+            if bot:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "🚫 <b>Доступ к боту заблокирован</b> — набрано максимальное число предупреждений.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramForbiddenError:
+                    pass
+                except TelegramBadRequest:
+                    pass
+        elif bot:
             try:
                 await bot.send_message(
                     user_id,
-                    "🚫 <b>Доступ к боту заблокирован</b> — набрано максимальное число предупреждений.",
+                    "⏳ <b>Набрано максимальное число предупреждений.</b> "
+                    "Решение о блокировке доступа принимает главный администратор.",
                     parse_mode=ParseMode.HTML,
                 )
             except TelegramForbiddenError:

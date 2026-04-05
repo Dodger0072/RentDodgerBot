@@ -136,6 +136,17 @@ async def _migrate_sqlite_item_rent_hours(conn) -> None:
         await conn.execute(text("ALTER TABLE items ADD COLUMN rent_hours_max INTEGER"))
 
 
+async def _migrate_sqlite_rental_handover_stat_actor(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(rental_handover_stats)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "handed_over_by_user_id" not in cols:
+        await conn.execute(
+            text("ALTER TABLE rental_handover_stats ADD COLUMN handed_over_by_user_id BIGINT")
+        )
+
+
 async def init_db() -> None:
     if engine is None:
         raise RuntimeError("Engine not configured")
@@ -148,6 +159,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
         await _migrate_sqlite_item_blackout_window(conn)
+        await _migrate_sqlite_rental_handover_stat_actor(conn)
 
     if async_session_maker is not None:
         async with async_session_maker() as session:

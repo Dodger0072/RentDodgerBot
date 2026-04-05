@@ -28,15 +28,12 @@ def item_notification_recipients(item: Item, settings: Settings) -> list[int]:
 
 
 def booking_reminder_recipient_ids(item: Item, settings: Settings) -> list[int]:
-    """Напоминания о скорой брони: владелец вещи (если есть) и все ADMIN_USER_IDS — без дублей.
+    """Напоминания о скорой выдаче по брони — только ответственные за вещь (как у заявок).
 
-    Так сообщение доходит и при рассинхроне owner_user_id с реальным админом, и при пустом owner
-    (как fallback в notify_admins_*).
+    У вещи с владельцем уведомление получает только он; у legacy без owner_user_id — все
+    ADMIN_USER_IDS (общий каталог).
     """
-    ids: set[int] = set(int(x) for x in settings.admin_user_ids)
-    for uid in item_notification_recipients(item, settings):
-        ids.add(int(uid))
-    return sorted(ids)
+    return item_notification_recipients(item, settings)
 
 
 async def landlord_contact_hint_html(bot: Bot, item: Item, settings: Settings) -> str:

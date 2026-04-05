@@ -122,3 +122,22 @@ def is_admin(user_id: int, username: str | None, settings: Settings) -> bool:
 
 def is_superadmin(user_id: int, settings: Settings) -> bool:
     return user_id in settings.superadmin_user_ids
+
+
+def superadmin_roles_enabled(settings: Settings) -> bool:
+    """В .env задан хотя бы один SUPERADMIN_USER_IDS — включены отдельные права суперадмина."""
+    return bool(settings.superadmin_user_ids)
+
+
+def can_ban_via_bot_commands(user_id: int, settings: Settings) -> bool:
+    """Бан/разбан командами: любой админ, если суперадмины не заданы; иначе только суперадмин."""
+    if not superadmin_roles_enabled(settings):
+        return True
+    return is_superadmin(user_id, settings)
+
+
+def can_autoban_from_warnings(issuer_user_id: int, settings: Settings) -> bool:
+    """Автобан при 3-м предупреждении только от суперадмина, если роли включены."""
+    if not superadmin_roles_enabled(settings):
+        return True
+    return is_superadmin(issuer_user_id, settings)

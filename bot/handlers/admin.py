@@ -13,7 +13,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.config import Settings, is_admin, is_superadmin
+from bot.config import (
+    Settings,
+    can_autoban_from_warnings,
+    can_ban_via_bot_commands,
+    is_admin,
+    is_superadmin,
+    superadmin_roles_enabled,
+)
 from bot.db.models import (
     AdminBlackoutWindow,
     BlackoutWindowItem,
@@ -53,6 +60,7 @@ from bot.services.rental import (
     price_for_hours,
     rent_hours_bounds,
 )
+from bot.services.admin_notify import notify_superadmins_discipline_warning
 from bot.services.rental_stats import fetch_rental_stats, record_handover_stat
 from bot.services.user_bans import (
     add_ban,
@@ -161,7 +169,13 @@ async def _finalize_rental_handover(
         total = price_for_hours(item, req_hours)
     except ValueError:
         total = Decimal("0")
-    record_handover_stat(session, item_id=rental.item_id, amount=total, handed_over_at=now)
+    record_handover_stat(
+        session,
+        item_id=rental.item_id,
+        amount=total,
+        handed_over_at=now,
+        handed_over_by_user_id=acting_user_id,
+    )
     await record_successful_handover(session, rental.user_id, rental.username)
     await session.commit()
     end_label = format_local_time(end, settings)
@@ -1213,6 +1227,14 @@ async def cmd_item_order(message: Message, settings: Settings) -> None:
 async def cmd_ban_user(message: Message, bot: Bot, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
+    if not can_ban_via_bot_commands(message.from_user.id, settings):
+        await message.answer(
+            "Блокировать пользователей по команде может только <b>суперадмин</b> "
+            "(переменная <code>SUPERADMIN_USER_IDS</code> в настройках бота). "
+            "Обычный админ может выдать предупреждение: <code>/warn</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     tokens = (message.text or "").strip().split()
     if len(tokens) < 2:
         await message.answer(
@@ -1280,6 +1302,13 @@ async def cmd_ban_user(message: Message, bot: Bot, settings: Settings) -> None:
 @router.message(Command("unban_user", "unban"))
 async def cmd_unban_user(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    if not can_ban_via_bot_commands(message.from_user.id, settings):
+        await message.answer(
+            "Снимать блокировку может только <b>суперадмин</b> "
+            "(<code>SUPERADMIN_USER_IDS</code>).",
+            parse_mode=ParseMode.HTML,
+        )
         return
     parts = (message.text or "").strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -1381,6 +1410,8 @@ async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
         "<b>Предупреждение от администратора.</b>\n"
         f"{format_warn_reason_for_user(reason_plain)}"
     )
+    apply_auto_ban = can_autoban_from_warnings(message.from_user.id, settings)
+    issuer_id = message.from_user.id
 
     try:
         async with db_session.async_session_maker() as session:
@@ -1395,6 +1426,7 @@ async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
                 reason_html=reason_html,
                 bot=bot,
                 ban_note=admin_note,
+                apply_auto_ban=apply_auto_ban,
             )
             await session.commit()
     except IntegrityError:
@@ -1404,7 +1436,29 @@ async def cmd_warn_user(message: Message, bot: Bot, settings: Settings) -> None:
         )
         return
 
-    extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD} предупреждений)." if banned else ""
+    if superadmin_roles_enabled(settings) and not is_superadmin(issuer_id, settings):
+        await notify_superadmins_discipline_warning(
+            bot,
+            settings,
+            issuer_user_id=issuer_id,
+            issuer_username=message.from_user.username,
+            target_user_id=user_id,
+            target_username=username_for_row,
+            warnings_count=cnt,
+            reason_plain=reason_plain,
+            at_threshold_without_ban=cnt >= WARNINGS_BAN_THRESHOLD and not banned,
+        )
+
+    extra = ""
+    if banned:
+        extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD} предупреждений)."
+    elif cnt >= WARNINGS_BAN_THRESHOLD:
+        extra = (
+            " Лимит предупреждений; автобан только от суперадмина. "
+            "Суперадмины получили уведомление в Telegram."
+            if superadmin_roles_enabled(settings)
+            else ""
+        )
     await message.answer(
         f"Готово. У пользователя <code>{user_id}</code> сейчас "
         f"<b>{cnt}</b> предупреждений из {WARNINGS_BAN_THRESHOLD}.{extra}",
@@ -1901,12 +1955,13 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
 async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
+    uid = message.from_user.id
     async with db_session.async_session_maker() as session:
-        snap = await fetch_rental_stats(session, settings)
+        snap = await fetch_rental_stats(session, settings, admin_user_id=uid)
         await session.commit()
     tz_hint = escape(settings.time_zone_label.strip() or "локальному времени бота")
     text = (
-        f"<b>Статистика аренды</b> <i>(сегодня / неделя / месяц — границы по {tz_hint})</i>\n\n"
+        f"<b>Ваша статистика аренды</b> <i>(сегодня / неделя / месяц — границы по {tz_hint})</i>\n\n"
         f"Заработано с аренды всего: {format_money(snap.earned_total)}\n"
         f"За сегодня: {format_money(snap.earned_today)}\n"
         f"За неделю: {format_money(snap.earned_week)}\n"
@@ -1915,9 +1970,10 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
         f"За сегодня: {snap.handovers_today}\n"
         f"За неделю: {snap.handovers_week}\n"
         f"За месяц: {snap.handovers_month}\n\n"
-        "<i>Учёт только с момента появления этой статистики: при каждой новой выдаче "
-        "(подтверждение часов в боте) пишется строка в БД. Старые выдачи и аренды, "
-        "которые бот потом удаляет после срока, в прошлое не восстанавливаются.</i>"
+        "<i>Только ваши выдачи: по подтвердившему админу; для старых записей без этого поля — "
+        "по владельцу вещи на момент просмотра (общие вещи без владельца в персональную статистику "
+        "не попадают). Учёт с момента появления функции; аренды после срока бот удаляет — "
+        "в прошлое не восстанавливаются.</i>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -2121,15 +2177,71 @@ async def admin_res_cancel_apply(message: Message, state: FSMContext, settings: 
         )
 
 
+async def _finalize_rental_not_handed(
+    bot: Bot,
+    settings: Settings,
+    *,
+    rental_id: int,
+    acting_user_id: int,
+    reason_plain: str,
+    rental_card_chat_id: int,
+    rental_card_message_id: int,
+) -> tuple[bool, str]:
+    """Снять ожидающую заявку, уведомить арендатора, обновить карточку админу. (ok, ошибка для alert)."""
+    reason_plain = (reason_plain or "").strip()
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Rental).options(selectinload(Rental.item)).where(Rental.id == rental_id)
+        )
+        rental = r.scalar_one_or_none()
+        if rental is None or rental.state != RentalState.pending_admin.value:
+            return False, "Заявка не найдена или уже обработана."
+        if not admin_manages_item(acting_user_id, rental.item):
+            return False, "Это не ваша вещь."
+        uid = rental.user_id
+        req_h = rental.requested_hours
+        item_name = rental.item.name if rental.item else "?"
+        await session.delete(rental)
+        await session.commit()
+
+    if reason_plain:
+        reason_block = f"\n<b>Причина:</b> {escape(reason_plain)}"
+    else:
+        reason_block = ""
+    user_text = (
+        "❌ <b>Вещь не сдана.</b> Заявка на аренду снята.\n\n"
+        f"Вещь: <b>{escape(item_name)}</b>\n"
+        f"Часов по заявке: {req_h}"
+        f"{reason_block}"
+    )
+    try:
+        await bot.send_message(uid, user_text, parse_mode=ParseMode.HTML)
+    except TelegramForbiddenError:
+        pass
+    except TelegramBadRequest:
+        pass
+
+    admin_card = "Отмечено: вещь не сдана. Заявка снята."
+    if reason_plain:
+        admin_card += f"\n<i>Пользователю:</i> {escape(reason_plain)}"
+    try:
+        await bot.edit_message_text(
+            admin_card,
+            chat_id=rental_card_chat_id,
+            message_id=rental_card_message_id,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        pass
+    return True, ""
+
+
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):no$"))
 async def admin_rental_reject(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if not _admin_only(settings, query.from_user.id, query.from_user.username):
         await query.answer("Нет доступа", show_alert=True)
         return
     rid = int(query.data.split(":")[2])
-    data = await state.get_data()
-    if data.get("pending_rental_id") == rid:
-        await state.clear()
     async with db_session.async_session_maker() as session:
         r = await session.execute(
             select(Rental).options(selectinload(Rental.item)).where(Rental.id == rid)
@@ -2141,10 +2253,139 @@ async def admin_rental_reject(query: CallbackQuery, state: FSMContext, settings:
         if not admin_manages_item(query.from_user.id, rental.item):
             await query.answer("Это не ваша вещь.", show_alert=True)
             return
-        await session.delete(rental)
-        await session.commit()
-    await query.message.edit_text("Отмечено: вещь не сдана. Заявка снята.")
+
+    data = await state.get_data()
+    if data.get("pending_rental_id") == rid:
+        await state.clear()
+    await state.set_state(AdminRentalStates.waiting_no_handover_reason)
+    await state.update_data(
+        pending_rental_id=None,
+        handover_chat_id=None,
+        handover_message_id=None,
+        reject_rental_id=rid,
+        reject_card_chat_id=query.message.chat.id,
+        reject_card_message_id=query.message.message_id,
+    )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="Без причины", callback_data=f"adm:r:{rid}:noreason"))
+    kb.row(InlineKeyboardButton(text="« Отмена", callback_data=f"adm:r:{rid}:noabort"))
+    sent = await query.message.answer(
+        "<b>Вещь не сдана</b> — заявка будет снята.\n\n"
+        "Отправьте <b>причину</b> одним сообщением (её увидит пользователь) "
+        "или нажмите «Без причины».",
+        reply_markup=kb.as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+    await state.update_data(
+        reject_prompt_chat_id=sent.chat.id,
+        reject_prompt_message_id=sent.message_id,
+    )
     await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:r:(\d+):noabort$"))
+async def admin_rental_reject_abort(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    rid = int(query.data.split(":")[2])
+    data = await state.get_data()
+    if data.get("reject_rental_id") != rid:
+        await query.answer("Устарело или другая заявка.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await query.message.edit_text("Снятие заявки отменено.")
+    except TelegramBadRequest:
+        pass
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:r:(\d+):noreason$"))
+async def admin_rental_reject_no_reason(
+    query: CallbackQuery, state: FSMContext, bot: Bot, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    rid = int(query.data.split(":")[2])
+    data = await state.get_data()
+    if data.get("reject_rental_id") != rid:
+        await query.answer("Устарело или другая заявка.", show_alert=True)
+        return
+    card_cid = data.get("reject_card_chat_id")
+    card_mid = data.get("reject_card_message_id")
+    if card_cid is None or card_mid is None:
+        await state.clear()
+        await query.answer("Ошибка состояния", show_alert=True)
+        return
+    ok, err = await _finalize_rental_not_handed(
+        bot,
+        settings,
+        rental_id=rid,
+        acting_user_id=query.from_user.id,
+        reason_plain="",
+        rental_card_chat_id=int(card_cid),
+        rental_card_message_id=int(card_mid),
+    )
+    await state.clear()
+    if not ok:
+        await query.answer(err, show_alert=True)
+        return
+    try:
+        await query.message.edit_text("Заявка снята (без причины для пользователя).")
+    except TelegramBadRequest:
+        pass
+    await query.answer("Готово")
+
+
+@router.message(StateFilter(AdminRentalStates.waiting_no_handover_reason), F.text)
+async def admin_rental_reject_reason_text(
+    message: Message, state: FSMContext, bot: Bot, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        await state.clear()
+        await message.answer("Ввод отменён. Заявка не снята.")
+        return
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("Причина не может быть пустой. Напишите текст или нажмите «Без причины».")
+        return
+    data = await state.get_data()
+    rid = data.get("reject_rental_id")
+    card_cid = data.get("reject_card_chat_id")
+    card_mid = data.get("reject_card_message_id")
+    if rid is None or card_cid is None or card_mid is None:
+        await state.clear()
+        return
+    ok, err = await _finalize_rental_not_handed(
+        bot,
+        settings,
+        rental_id=int(rid),
+        acting_user_id=message.from_user.id,
+        reason_plain=reason,
+        rental_card_chat_id=int(card_cid),
+        rental_card_message_id=int(card_mid),
+    )
+    pch = data.get("reject_prompt_chat_id")
+    pmid = data.get("reject_prompt_message_id")
+    await state.clear()
+    if not ok:
+        await message.answer(err)
+        return
+    if pch is not None and pmid is not None:
+        try:
+            await bot.edit_message_text(
+                "Заявка снята (причина отправлена пользователю).",
+                chat_id=int(pch),
+                message_id=int(pmid),
+            )
+        except TelegramBadRequest:
+            pass
+    await message.answer("Заявка снята, пользователь уведомлён с указанной причиной.")
 
 
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):warn$"))
@@ -2181,6 +2422,7 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
                 "<b>Предупреждение от администратора.</b>\n"
                 f"{format_warn_reason_for_user(reason_plain)}"
             )
+            apply_auto_ban = can_autoban_from_warnings(query.from_user.id, settings)
             cnt, banned = await add_warning(
                 session,
                 user_id=rental.user_id,
@@ -2188,6 +2430,7 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
                 reason_html=reason_html,
                 bot=bot,
                 ban_note=admin_note,
+                apply_auto_ban=apply_auto_ban,
             )
             await session.commit()
     except IntegrityError:
@@ -2196,7 +2439,23 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
             show_alert=True,
         )
         return
-    extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD})." if banned else ""
+    if superadmin_roles_enabled(settings) and not is_superadmin(query.from_user.id, settings):
+        await notify_superadmins_discipline_warning(
+            bot,
+            settings,
+            issuer_user_id=query.from_user.id,
+            issuer_username=query.from_user.username,
+            target_user_id=rental.user_id,
+            target_username=rental.username,
+            warnings_count=cnt,
+            reason_plain=reason_plain,
+            at_threshold_without_ban=cnt >= WARNINGS_BAN_THRESHOLD and not banned,
+        )
+    extra = ""
+    if banned:
+        extra = f" Доступ заблокирован (≥{WARNINGS_BAN_THRESHOLD})."
+    elif cnt >= WARNINGS_BAN_THRESHOLD and superadmin_roles_enabled(settings):
+        extra = " Лимит; суперадмины уведомлены."
     await query.answer(
         f"Предупреждение выдано. Сейчас у пользователя {cnt}/{WARNINGS_BAN_THRESHOLD}.{extra}",
         show_alert=True,

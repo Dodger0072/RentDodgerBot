@@ -139,6 +139,7 @@ class RentalHandoverStat(Base):
         ForeignKey("items.id", ondelete="SET NULL"),
         nullable=True,
     )
+    handed_over_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     handed_over_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
