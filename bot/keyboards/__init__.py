@@ -5,6 +5,7 @@ from bot.keyboards.inline import (
     confirm_keyboard,
     home_keyboard,
     item_list_keyboard,
+    nav_back_keyboard,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "confirm_keyboard",
     "home_keyboard",
     "item_list_keyboard",
+    "nav_back_keyboard",
 ]

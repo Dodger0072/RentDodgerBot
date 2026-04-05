@@ -16,7 +16,7 @@ from bot.config import Settings
 from bot.db import session as db_session
 from bot.db.models import Rental, RentalState, Reservation
 from bot.services.admin_notify import notify_admins_pending_rental
-from bot.services.item_owner import item_notification_recipients, landlord_contact_hint_html
+from bot.services.item_owner import booking_reminder_recipient_ids, landlord_contact_hint_html
 from bot.services.rental import ensure_utc, expire_expired_rentals, price_for_hours
 from bot.time_format import format_local_time
 
@@ -95,7 +95,7 @@ async def process_reservation_reminders(bot: Bot, settings: Settings) -> None:
                     f"Арендатор: {renter}\n"
                     f"С {format_local_time(start, settings)} по {format_local_time(end, settings)}"
                 )
-                for admin_id in sorted(set(item_notification_recipients(item, settings))):
+                for admin_id in booking_reminder_recipient_ids(item, settings):
                     if admin_id == res.user_id:
                         continue
                     await _send_reminder(bot, admin_id, owner_text)
@@ -110,7 +110,7 @@ async def process_reservation_reminders(bot: Bot, settings: Settings) -> None:
                     f"Арендатор: {renter}\n"
                     f"Начало слота: {format_local_time(start, settings)} — {format_local_time(end, settings)}"
                 )
-                for admin_id in sorted(set(item_notification_recipients(item, settings))):
+                for admin_id in booking_reminder_recipient_ids(item, settings):
                     if admin_id == res.user_id:
                         continue
                     await _send_reminder(bot, admin_id, owner_text)

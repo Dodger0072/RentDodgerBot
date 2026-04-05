@@ -30,6 +30,7 @@ from bot.keyboards.inline import (
     home_keyboard,
     inventory_subcategory_keyboard,
     item_list_keyboard,
+    nav_back_keyboard,
 )
 from bot.services.admin_notify import (
     notify_admins_new_reservation,
@@ -82,7 +83,7 @@ def _my_reservations_keyboard(reservations: list[Reservation], *, now: datetime)
                     callback_data=f"u:cnlres:{res.id}",
                 )
             )
-    b.row(InlineKeyboardButton(text="« Главное меню", callback_data="u:home"))
+    b.row(InlineKeyboardButton(text="« К каталогу", callback_data="u:home"))
     return b.as_markup()
 
 
@@ -123,65 +124,37 @@ async def _send_item_visual(target: Message, item: Item, caption: str, reply_mar
         await target.answer(caption, reply_markup=reply_markup)
 
 
-@router.callback_query(F.data == "cat:paid")
-async def cat_paid(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
-    await state.clear()
+def _catalog_kind_and_slug(item: Item) -> tuple[str, str]:
+    kind = "paid" if item.is_paid else "free"
+    raw = (item.item_category or "").strip()
+    slug = UNCATEGORIZED_SLUG if not raw else raw
+    return kind, slug
+
+
+async def _send_subcategory_choice_menu(message: Message, *, is_paid: bool) -> bool:
     async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item.id).where(Item.is_paid.is_(True)).limit(1))
+        r = await session.execute(select(Item.id).where(Item.is_paid.is_(is_paid)).limit(1))
         if r.scalar_one_or_none() is None:
             await session.commit()
-            await query.answer("Пока нет вещей в платной аренде", show_alert=True)
-            return
-        cat_rows = await non_empty_rental_category_menu_rows(session, is_paid=True)
+            return False
+        cat_rows = await non_empty_rental_category_menu_rows(session, is_paid=is_paid)
         await session.commit()
     if not cat_rows:
-        await query.answer("Каталог временно недоступен", show_alert=True)
-        return
-    await query.message.answer(
-        "Платная аренда — выберите <b>категорию вещей</b>:",
-        reply_markup=inventory_subcategory_keyboard(is_paid=True, rows=cat_rows),
+        return False
+    kind_ru = "Платная" if is_paid else "Бесплатная"
+    await message.answer(
+        f"{kind_ru} аренда — выберите <b>категорию вещей</b>:",
+        reply_markup=inventory_subcategory_keyboard(is_paid=is_paid, rows=cat_rows),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
+    return True
 
 
-@router.callback_query(F.data == "cat:free")
-async def cat_free(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
-    await state.clear()
-    async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item.id).where(Item.is_paid.is_(False)).limit(1))
-        if r.scalar_one_or_none() is None:
-            await session.commit()
-            await query.answer("Пока нет вещей в бесплатной аренде", show_alert=True)
-            return
-        cat_rows = await non_empty_rental_category_menu_rows(session, is_paid=False)
-        await session.commit()
-    if not cat_rows:
-        await query.answer("Каталог временно недоступен", show_alert=True)
-        return
-    await query.message.answer(
-        "Бесплатная аренда — выберите <b>категорию вещей</b>:",
-        reply_markup=inventory_subcategory_keyboard(is_paid=False, rows=cat_rows),
-        parse_mode=ParseMode.HTML,
-    )
-    await query.answer()
-
-
-@router.callback_query(F.data.startswith("u:grp:"))
-async def cat_then_inventory_group(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
-    await state.clear()
-    parts = (query.data or "").split(":")
-    if len(parts) != 4 or parts[0] != "u" or parts[1] != "grp":
-        await query.answer()
-        return
-    kind, slug = parts[2], parts[3]
-    if kind not in ("paid", "free"):
-        await query.answer()
-        return
-    is_paid = kind == "paid"
+async def _send_group_inventory_list(
+    message: Message, *, is_paid: bool, slug: str, settings: Settings
+) -> bool:
     if not slug or len(slug) > 48 or ":" in slug:
-        await query.answer("Некорректные данные", show_alert=True)
-        return
+        return False
     async with db_session.async_session_maker() as session:
         q = select(Item).where(Item.is_paid.is_(is_paid))
         if slug == UNCATEGORIZED_SLUG:
@@ -199,38 +172,28 @@ async def cat_then_inventory_group(query: CallbackQuery, state: FSMContext, sett
         ]
         await session.commit()
     if not items:
-        await query.answer("В этой категории пока нет вещей", show_alert=True)
-        return
+        return False
     kind_ru = "Платная" if is_paid else "Бесплатная"
     if slug == UNCATEGORIZED_SLUG:
         title = f"{kind_ru} аренда — без категории"
     else:
         title = f"{kind_ru} аренда — {item_category_label(slug)}"
-    await query.message.answer(
+    catalog_kind = "paid" if is_paid else "free"
+    await message.answer(
         f"{title}. Выберите вещь:",
-        reply_markup=item_list_keyboard(items, "u"),
+        reply_markup=item_list_keyboard(items, "u", catalog_kind=catalog_kind),
     )
-    await query.answer()
+    return True
 
 
-@router.callback_query(F.data == "u:back")
-async def user_back(query: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
-    await query.answer()
-
-
-@router.callback_query(F.data.regexp(r"^u:item:(\d+)$"))
-async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
-    await state.clear()
-    item_id = int(query.data.split(":")[2])
+async def _send_user_item_card(target: Message, item_id: int, settings: Settings) -> None:
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
         r = await session.execute(select(Item).where(Item.id == item_id))
         item = r.scalar_one_or_none()
         if item is None:
             await session.rollback()
-            await query.answer("Вещь не найдена", show_alert=True)
+            await target.answer("Вещь не найдена.", reply_markup=home_keyboard())
             return
         st = await user_facing_status(session, item_id)
         await session.commit()
@@ -309,10 +272,286 @@ async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Sett
         )
         b.row(InlineKeyboardButton(text="Забронировать", callback_data=f"book:{item_id}"))
 
-    b.row(InlineKeyboardButton(text="« Главное меню", callback_data="u:home"))
+    ck, cslug = _catalog_kind_and_slug(item)
+    b.row(InlineKeyboardButton(text="« Назад", callback_data=f"u:items:{ck}:{cslug}"))
     caption = _item_caption(item, settings, extra)
-    await query.message.answer("Карточка вещи:")
-    await _send_item_visual(query.message, item, caption, b.as_markup())
+    await target.answer("Карточка вещи:")
+    await _send_item_visual(target, item, caption, b.as_markup())
+
+
+async def _send_rent_hours_prompt(
+    message: Message, item_id: int, settings: Settings, state: FSMContext
+) -> bool:
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        await expire_expired_rentals(session)
+        await session.commit()
+        st = await user_facing_status(session, item_id)
+        ref_now = datetime.now(UTC)
+        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        item = r_item.scalar_one_or_none()
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        await session.commit()
+    if st is None or item is None or not can_take_immediate_rent(st, ref_now):
+        return False
+    lo, hi = rent_hours_bounds(item)
+    hi_cap = min(st.immediate_rent_max_hours, hi)
+    await state.update_data(immediate_max_hours=hi_cap)
+    hours_line = (
+        f"Укажите срок аренды в часах (целое число от {lo} до {hi_cap}; "
+        f"не дольше, чем до ближайшей брони или занятой аренды):"
+    )
+    await message.answer(
+        hours_line + notice,
+        reply_markup=nav_back_keyboard(),
+        parse_mode=ParseMode.HTML if notice else None,
+    )
+    return True
+
+
+async def _send_booking_start_prompt(
+    message: Message, item_id: int, settings: Settings, state: FSMContext
+) -> None:
+    async with db_session.async_session_maker() as session:
+        await expire_expired_rentals(session)
+        await session.commit()
+        st = await user_facing_status(session, item_id)
+    if st is None:
+        await state.clear()
+        await message.answer("Ошибка загрузки.", reply_markup=home_keyboard())
+        return
+    if st.pending_admin:
+        await state.clear()
+        await message.answer(
+            "Сначала дождитесь решения администратора по текущей заявке",
+            reply_markup=home_keyboard(),
+        )
+        return
+    async with db_session.async_session_maker() as session:
+        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        book_item = r_item.scalar_one_or_none()
+    if book_item is None:
+        await state.clear()
+        await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
+        return
+    notice = ""
+    avail_html = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        avail_html = await format_user_booking_availability_block(
+            session, item_id, book_item, settings, now=datetime.now(UTC)
+        )
+        await session.commit()
+    lines = [
+        "Введите дату и время <b>начала</b> брони.\n"
+        "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+        "Пример: <code>04.05.2026 10:00</code>\n\n"
+        "Ниже — когда можно выбрать начало с учётом минимальной аренды; "
+        "слот не должен пересекаться с чужими бронями.\n\n",
+    ]
+    if st.in_blackout and st.blackout_until is not None:
+        lines.append(
+            f"\nСейчас до <b>{_fmt_utc_local(st.blackout_until, settings)}</b> владелец не сдаёт вещь — "
+            f"укажите начало <b>после</b> этого времени (слот не должен с этим пересекаться)."
+        )
+    lines.append(booking_rules_block())
+    if notice:
+        lines.append(notice)
+    lines.append("\n\n")
+    lines.append(avail_html)
+    await message.answer(
+        "".join(lines),
+        reply_markup=nav_back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _resend_book_hours_prompt(
+    message: Message, item_id: int, settings: Settings, state: FSMContext
+) -> bool:
+    data = await state.get_data()
+    start_raw = data.get("book_start_iso")
+    if not start_raw:
+        return False
+    start_at = ensure_utc(datetime.fromisoformat(str(start_raw)))
+    if start_at is None:
+        return False
+    now = datetime.now(UTC)
+    if reservation_start_in_past_error(start_at, now) is not None:
+        return False
+    async with db_session.async_session_maker() as session:
+        await expire_expired_rentals(session)
+        r = await session.execute(select(Item).where(Item.id == item_id))
+        item = r.scalar_one_or_none()
+        if item is None:
+            await session.rollback()
+            return False
+        rr = await load_rr_busy_intervals_utc(session, item_id)
+        await session.commit()
+    lo, hi = rent_lo_hi(item)
+    max_h = max_hours_from_start(start_at, rr, lo, hi)
+    if max_h < lo:
+        return False
+    hi_eff = min(hi, max_h)
+    cap_end = max_reservation_end_utc(start_at, rr)
+    notice = ""
+    async with db_session.async_session_maker() as session:
+        notice = await near_ban_notice_for_user(session, message.from_user.id)
+        await session.commit()
+    await message.answer(
+        f"Начало: <b>{_fmt_utc_local(start_at, settings)}</b>.\n"
+        f"Можно забронировать не длиннее <b>{max_h}</b> ч. "
+        f"(не позже {_fmt_utc_local(cap_end, settings)} — дальше уже занято или лимит {hi} ч.).\n"
+        f"Введите число часов от <b>{lo}</b> до <b>{hi_eff}</b>:"
+        + notice,
+        reply_markup=nav_back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return True
+
+
+@router.callback_query(F.data == "cat:paid")
+async def cat_paid(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    ok = await _send_subcategory_choice_menu(query.message, is_paid=True)
+    if not ok:
+        await query.answer("Пока нет вещей в платной аренде", show_alert=True)
+        return
+    await query.answer()
+
+
+@router.callback_query(F.data == "cat:free")
+async def cat_free(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    ok = await _send_subcategory_choice_menu(query.message, is_paid=False)
+    if not ok:
+        await query.answer("Пока нет вещей в бесплатной аренде", show_alert=True)
+        return
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^u:subcat:(paid|free)$"))
+async def user_subcat_back(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    kind = (query.data or "").split(":")[2]
+    is_paid = kind == "paid"
+    ok = await _send_subcategory_choice_menu(query.message, is_paid=is_paid)
+    if not ok:
+        await query.answer("Каталог временно недоступен", show_alert=True)
+        return
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("u:grp:"))
+async def cat_then_inventory_group(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    parts = (query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "u" or parts[1] != "grp":
+        await query.answer()
+        return
+    kind, slug = parts[2], parts[3]
+    if kind not in ("paid", "free"):
+        await query.answer()
+        return
+    is_paid = kind == "paid"
+    ok = await _send_group_inventory_list(
+        query.message, is_paid=is_paid, slug=slug, settings=settings
+    )
+    if not ok:
+        await query.answer("В этой категории пока нет вещей", show_alert=True)
+        return
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^u:items:(paid|free):(.+)$"))
+async def user_back_to_inventory_list(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    parts = (query.data or "").split(":")
+    kind, slug = parts[2], parts[3]
+    if kind not in ("paid", "free"):
+        await query.answer()
+        return
+    is_paid = kind == "paid"
+    ok = await _send_group_inventory_list(
+        query.message, is_paid=is_paid, slug=slug, settings=settings
+    )
+    if not ok:
+        await query.answer("Список недоступен", show_alert=True)
+        return
+    await query.answer()
+
+
+@router.callback_query(F.data == "u:back")
+async def user_back(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^u:item:(\d+)$"))
+async def user_open_item(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    await state.clear()
+    item_id = int(query.data.split(":")[2])
+    await _send_user_item_card(query.message, item_id, settings)
+    await query.answer()
+
+
+@router.callback_query(F.data == "u:nav:back")
+async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    st = await state.get_state()
+    data = await state.get_data()
+
+    if st == UserRentStates.waiting_confirm.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserRentStates.waiting_hours)
+        await state.update_data(hours=None, total=None)
+        ok = await _send_rent_hours_prompt(query.message, item_id, settings, state)
+        if not ok:
+            await state.clear()
+            await query.message.answer(
+                "Вещь недоступна для этой операции.",
+                reply_markup=home_keyboard(),
+            )
+        await query.answer()
+        return
+
+    if st == UserRentStates.waiting_hours.state and data.get("flow") == "rent":
+        item_id = int(data.get("item_id", 0))
+        await state.clear()
+        await _send_user_item_card(query.message, item_id, settings)
+        await query.answer()
+        return
+
+    if st == UserBookStates.waiting_confirm.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserBookStates.waiting_hours)
+        await state.update_data(hours=None, total=None)
+        if not await _resend_book_hours_prompt(query.message, item_id, settings, state):
+            await state.clear()
+            await query.message.answer(
+                "Не удалось вернуться к шагу с часами — начните бронь заново.",
+                reply_markup=home_keyboard(),
+            )
+        await query.answer()
+        return
+
+    if st == UserBookStates.waiting_hours.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserBookStates.waiting_start_datetime)
+        await state.update_data(book_start_iso=None, hours=None, total=None)
+        await _send_booking_start_prompt(query.message, item_id, settings, state)
+        await query.answer()
+        return
+
+    if st == UserBookStates.waiting_start_datetime.state:
+        item_id = int(data.get("item_id", 0))
+        await state.clear()
+        await _send_user_item_card(query.message, item_id, settings)
+        await query.answer()
+        return
+
+    await state.clear()
+    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
     await query.answer()
 
 
@@ -359,7 +598,7 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
     )
     await query.message.answer(
         hours_line + notice,
-        reply_markup=home_keyboard(),
+        reply_markup=nav_back_keyboard(),
         parse_mode=ParseMode.HTML if notice else None,
     )
     await query.answer()
@@ -384,39 +623,10 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
     if book_item is None:
         await query.answer("Вещь не найдена", show_alert=True)
         return
-    notice = ""
-    avail_html = ""
-    async with db_session.async_session_maker() as session:
-        notice = await near_ban_notice_for_user(session, query.from_user.id)
-        avail_html = await format_user_booking_availability_block(
-            session, item_id, book_item, settings, now=datetime.now(UTC)
-        )
-        await session.commit()
     await state.clear()
     await state.set_state(UserBookStates.waiting_start_datetime)
     await state.update_data(item_id=item_id, flow="book")
-    lines = [
-        "Введите дату и время <b>начала</b> брони.\n"
-        "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
-        "Пример: <code>04.05.2026 10:00</code>\n\n"
-        "Ниже — когда можно выбрать начало с учётом минимальной аренды; "
-        "слот не должен пересекаться с чужими бронями.\n\n",
-    ]
-    if st.in_blackout and st.blackout_until is not None:
-        lines.append(
-            f"\nСейчас до <b>{_fmt_utc_local(st.blackout_until, settings)}</b> владелец не сдаёт вещь — "
-            f"укажите начало <b>после</b> этого времени (слот не должен с этим пересекаться)."
-        )
-    lines.append(booking_rules_block())
-    if notice:
-        lines.append(notice)
-    lines.append("\n\n")
-    lines.append(avail_html)
-    await query.message.answer(
-        "".join(lines),
-        reply_markup=home_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
+    await _send_booking_start_prompt(query.message, item_id, settings, state)
     await query.answer()
 
 
@@ -429,14 +639,14 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
         await message.answer(
             "Не получилось разобрать дату. Используйте формат "
             "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>, например <code>04.05.2026 10:00</code>.",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
             parse_mode=ParseMode.HTML,
         )
         return
     now = datetime.now(UTC)
     past_err = reservation_start_in_past_error(parsed, now)
     if past_err is not None:
-        await message.answer(past_err, reply_markup=home_keyboard())
+        await message.answer(past_err, reply_markup=nav_back_keyboard())
         return
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
@@ -471,7 +681,7 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
             await session.rollback()
             await message.answer(
                 msg + "\n\n" + avail,
-                reply_markup=home_keyboard(),
+                reply_markup=nav_back_keyboard(),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -486,13 +696,14 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
                 f"После выбранного начала до ближайшей брони или аренды меньше {lo} ч. "
                 "Выберите другое время — ниже подсказка по свободным окнам.\n\n"
                 + avail,
-                reply_markup=home_keyboard(),
+                reply_markup=nav_back_keyboard(),
                 parse_mode=ParseMode.HTML,
             )
             return
         await session.commit()
 
     cap_end = max_reservation_end_utc(parsed, rr)
+    hi_eff = min(hi, max_h)
     await state.update_data(book_start_iso=parsed.isoformat())
     await state.set_state(UserBookStates.waiting_hours)
     notice = ""
@@ -503,9 +714,9 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
         f"Начало: <b>{_fmt_utc_local(parsed, settings)}</b>.\n"
         f"Можно забронировать не длиннее <b>{max_h}</b> ч. "
         f"(не позже {_fmt_utc_local(cap_end, settings)} — дальше уже занято или лимит {hi} ч.).\n"
-        f"Введите число часов от <b>{lo}</b> до <b>{max_h}</b>:"
+        f"Введите число часов от <b>{lo}</b> до <b>{hi_eff}</b>:"
         + notice,
-        reply_markup=home_keyboard(),
+        reply_markup=nav_back_keyboard(),
         parse_mode=ParseMode.HTML,
     )
 
@@ -519,7 +730,7 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
     except ValueError:
         await message.answer(
             "Нужно целое число часов.",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     async with db_session.async_session_maker() as session:
@@ -534,7 +745,7 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
     if h < lo or h > cap:
         await message.answer(
             f"Допустимо от {lo} до {cap} ч. (до ближайшей брони или аренды не больше {cap} ч.).",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     try:
@@ -542,7 +753,7 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
     except ValueError as e:
         await message.answer(
             f"Ошибка расчёта: {e}",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     notice = ""
@@ -573,10 +784,8 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
     item_id = int(parts[2])
     if not yes:
         await state.clear()
-        await query.message.edit_text(
-            "Заявка отменена.",
-            reply_markup=home_keyboard(),
-        )
+        await query.message.edit_text("Заявка отменена.", reply_markup=None)
+        await _send_user_item_card(query.message, item_id, settings)
         await query.answer()
         return
     data = await state.get_data()
@@ -661,7 +870,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
     except ValueError:
         await message.answer(
             "Нужно целое число часов.",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     async with db_session.async_session_maker() as session:
@@ -703,7 +912,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
         await message.answer(
             f"Укажите целое число часов от {lo} до {hi_eff} "
             f"(до {_fmt_utc_local(max_reservation_end_utc(start_at, rr), settings)}).",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     try:
@@ -711,7 +920,7 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
     except ValueError as e:
         await message.answer(
             f"Ошибка расчёта: {e}",
-            reply_markup=home_keyboard(),
+            reply_markup=nav_back_keyboard(),
         )
         return
     notice = ""
@@ -747,10 +956,8 @@ async def user_book_confirm(
     item_id = int(parts[2])
     if not yes:
         await state.clear()
-        await query.message.edit_text(
-            "Бронь отменена.",
-            reply_markup=home_keyboard(),
-        )
+        await query.message.edit_text("Бронь отменена.", reply_markup=None)
+        await _send_user_item_card(query.message, item_id, settings)
         await query.answer()
         return
     data = await state.get_data()

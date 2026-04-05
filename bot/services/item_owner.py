@@ -27,6 +27,18 @@ def item_notification_recipients(item: Item, settings: Settings) -> list[int]:
     return sorted(settings.admin_user_ids)
 
 
+def booking_reminder_recipient_ids(item: Item, settings: Settings) -> list[int]:
+    """Напоминания о скорой брони: владелец вещи (если есть) и все ADMIN_USER_IDS — без дублей.
+
+    Так сообщение доходит и при рассинхроне owner_user_id с реальным админом, и при пустом owner
+    (как fallback в notify_admins_*).
+    """
+    ids: set[int] = set(int(x) for x in settings.admin_user_ids)
+    for uid in item_notification_recipients(item, settings):
+        ids.add(int(uid))
+    return sorted(ids)
+
+
 async def landlord_contact_hint_html(bot: Bot, item: Item, settings: Settings) -> str:
     """Короткая HTML-строка: кому в Telegram написать за выдачей вещи (для арендатора)."""
     if item.owner_user_id is not None:
@@ -71,6 +83,15 @@ async def items_blackout_scope_for_admin(session: AsyncSession, admin_user_id: i
         .order_by(Item.id)
     )
     return list(r.scalars().unique())
+
+
+def admin_can_edit_item(user_id: int, item: Item | None, settings: Settings) -> bool:
+    """Редактирование: владелец или общая вещь (любой админ); суперадмин — любые."""
+    if item is None:
+        return False
+    if is_superadmin(user_id, settings):
+        return True
+    return admin_manages_item(user_id, item)
 
 
 def admin_can_delete_item(user_id: int, item: Item | None, settings: Settings) -> bool:

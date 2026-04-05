@@ -29,8 +29,10 @@ from bot.keyboards.inline import (
     admin_hours_keyboard,
     admin_item_category_keyboard,
     admin_rental_decision_keyboard,
+    edit_item_category_keyboard,
+    edit_item_menu_keyboard,
 )
-from bot.item_categories import ITEM_CATEGORY_SLUGS, item_category_label
+from bot.item_categories import ITEM_CATEGORY_SLUGS, UNCATEGORIZED_SLUG, item_category_label
 from bot.services.booking_schedule import parse_booking_start_text
 from bot.services.item_blackout import (
     cancel_pending_rentals_hit_by_blackout,
@@ -39,6 +41,7 @@ from bot.services.item_blackout import (
 from bot.services.item_order import next_display_order_for_group, reorder_item_to_position
 from bot.services.item_owner import (
     admin_can_delete_item,
+    admin_can_edit_item,
     admin_manages_item,
     items_blackout_scope_for_admin,
 )
@@ -68,7 +71,13 @@ from bot.services.user_discipline import (
     record_successful_handover,
 )
 from bot.time_format import format_local_time
-from bot.states import AddItemStates, AdminBlackoutStates, AdminRentalStates, AdminReservationStates
+from bot.states import (
+    AddItemStates,
+    AdminBlackoutStates,
+    AdminRentalStates,
+    AdminReservationStates,
+    EditItemStates,
+)
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +93,44 @@ def _omit_fsm_keys(d: dict, *keys: str) -> dict:
 
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
     return is_admin(user_id, username, settings)
+
+
+async def _require_editable_item(
+    session: AsyncSession,
+    item_id: int,
+    user_id: int,
+    username: str | None,
+    settings: Settings,
+) -> tuple[Item | None, str | None]:
+    if not _admin_only(settings, user_id, username):
+        return None, "access"
+    r = await session.execute(select(Item).where(Item.id == item_id))
+    item = r.scalar_one_or_none()
+    if item is None:
+        return None, "missing"
+    if not admin_can_edit_item(user_id, item, settings):
+        return None, "rights"
+    return item, None
+
+
+def _edit_item_header_html(item: Item) -> str:
+    cat = "платная" if item.is_paid else "бесплатная"
+    ic = item_category_label(item.item_category)
+    lo, hi = rent_hours_bounds(item)
+    prices = ""
+    if item.is_paid:
+        ph = item.price_hour if item.price_hour is not None else Decimal("0")
+        pd = item.price_day if item.price_day is not None else Decimal("0")
+        pw = item.price_week if item.price_week is not None else Decimal("0")
+        prices = (
+            f"\nЦены: {format_money(ph)} / ч, {format_money(pd)} / сут., "
+            f"{format_money(pw)} / нед."
+        )
+    return (
+        f"<b>Вещь #{item.id}</b> — {escape(item.name)}\n"
+        f"{cat} · {ic} · срок {lo}–{hi} ч{prices}\n\n"
+        f"Что изменить?"
+    )
 
 
 async def _finalize_rental_handover(
@@ -493,6 +540,562 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
     await message.answer("Вещь добавлена (платная аренда).")
 
 
+def _edit_item_cb_filter(query: CallbackQuery) -> bool:
+    d = query.data or ""
+    return d.startswith("adm:e:") and not d.startswith("adm:ec:")
+
+
+def _edit_item_err_text(code: str | None) -> str:
+    if code == "missing":
+        return "Вещь не найдена."
+    if code == "rights":
+        return (
+            "Редактировать может владелец вещи, любой админ для «общей» вещи без владельца "
+            "или суперадмин."
+        )
+    return "Нет доступа."
+
+
+@router.message(Command("edit_item"))
+async def cmd_edit_item(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /edit_item 5 — где 5 это id вещи из /list_items")
+        return
+    try:
+        iid = int(parts[1].strip())
+    except ValueError:
+        await message.answer("Нужен числовой id.")
+        return
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            iid,
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err:
+            await message.answer(_edit_item_err_text(err))
+            return
+    await message.answer(
+        _edit_item_header_html(item),
+        reply_markup=edit_item_menu_keyboard(item.id, is_paid=bool(item.is_paid)),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(_edit_item_cb_filter)
+async def edit_item_action_cb(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 4:
+        await query.answer("Ошибка", show_alert=True)
+        return
+    try:
+        iid = int(parts[2])
+    except ValueError:
+        await query.answer("Ошибка", show_alert=True)
+        return
+    action = parts[3]
+
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            iid,
+            query.from_user.id,
+            query.from_user.username,
+            settings,
+        )
+
+        if action == "menu":
+            if err or item is None:
+                await query.answer(_edit_item_err_text(err), show_alert=True)
+                return
+            try:
+                await query.message.edit_text(
+                    _edit_item_header_html(item),
+                    reply_markup=edit_item_menu_keyboard(
+                        item.id, is_paid=bool(item.is_paid)
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                await query.message.answer(
+                    _edit_item_header_html(item),
+                    reply_markup=edit_item_menu_keyboard(
+                        item.id, is_paid=bool(item.is_paid)
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            await query.answer()
+            return
+
+        if action == "x":
+            if err or item is None:
+                await query.answer(_edit_item_err_text(err), show_alert=True)
+                return
+            try:
+                await query.message.edit_text(
+                    "Меню редактирования закрыто. Снова: <code>/edit_item id</code>",
+                    reply_markup=None,
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                await query.message.answer(
+                    "Меню закрыто. Снова: /edit_item id",
+                )
+            await query.answer()
+            return
+
+        if err or item is None:
+            await query.answer(_edit_item_err_text(err), show_alert=True)
+            return
+
+        if action == "tofree":
+            if not item.is_paid:
+                await query.answer("Уже бесплатная аренда.", show_alert=True)
+                return
+            item.is_paid = False
+            item.price_hour = None
+            item.price_day = None
+            item.price_week = None
+            item.display_order = await next_display_order_for_group(
+                session, False, item.item_category
+            )
+            await session.commit()
+            try:
+                await query.message.edit_text(
+                    _edit_item_header_html(item),
+                    reply_markup=edit_item_menu_keyboard(
+                        item.id, is_paid=False
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                await query.message.answer(
+                    _edit_item_header_html(item),
+                    reply_markup=edit_item_menu_keyboard(item.id, is_paid=False),
+                    parse_mode=ParseMode.HTML,
+                )
+            await query.answer("Тип: бесплатная.")
+            return
+
+        if action == "topaid":
+            if item.is_paid:
+                await query.answer("Уже платная аренда.", show_alert=True)
+                return
+
+        if action == "prices":
+            if not item.is_paid:
+                await query.answer(
+                    "Цены задаются только для платной аренды.",
+                    show_alert=True,
+                )
+                return
+
+    if action == "topaid":
+        await query.answer()
+        await state.set_state(EditItemStates.rent_hours_min)
+        await state.update_data(edit_item_id=iid, edit_flow="topaid")
+        await query.message.answer(
+            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+        )
+        return
+
+    if action == "nm":
+        await state.set_state(EditItemStates.name)
+        await state.update_data(edit_item_id=iid)
+        await query.message.answer("Введите новое название:")
+        await query.answer()
+        return
+    if action == "dc":
+        await state.set_state(EditItemStates.description)
+        await state.update_data(edit_item_id=iid)
+        await query.message.answer("Введите новое описание:")
+        await query.answer()
+        return
+    if action == "ct":
+        await query.message.answer(
+            "Выберите категорию:",
+            reply_markup=edit_item_category_keyboard(iid),
+            parse_mode=ParseMode.HTML,
+        )
+        await query.answer()
+        return
+    if action == "ph":
+        await state.set_state(EditItemStates.photos)
+        await state.update_data(edit_item_id=iid, photos=[])
+        await query.message.answer(
+            "Пришлите новые фото (можно несколько). Они <b>заменят</b> все текущие. "
+            "Когда закончите — напишите /done.",
+            parse_mode=ParseMode.HTML,
+        )
+        await query.answer()
+        return
+    if action == "rh":
+        await state.set_state(EditItemStates.rent_hours_min)
+        await state.update_data(edit_item_id=iid, edit_flow="rent")
+        await query.message.answer(
+            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+        )
+        await query.answer()
+        return
+    if action == "prices":
+        await query.answer()
+        await state.set_state(EditItemStates.price_hour)
+        await state.update_data(edit_item_id=iid, edit_flow="prices")
+        await query.message.answer("Введите цену за час (число, например 100):")
+        return
+
+    await query.answer("Неизвестное действие", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm:ec:"))
+async def edit_item_category_cb(query: CallbackQuery, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 4:
+        await query.answer("Ошибка", show_alert=True)
+        return
+    try:
+        iid = int(parts[2])
+    except ValueError:
+        await query.answer("Ошибка", show_alert=True)
+        return
+    slug = parts[3]
+    if slug == UNCATEGORIZED_SLUG:
+        new_cat: str | None = None
+    elif slug in ITEM_CATEGORY_SLUGS:
+        new_cat = slug
+    else:
+        await query.answer("Неизвестная категория", show_alert=True)
+        return
+
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            iid,
+            query.from_user.id,
+            query.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await query.answer(_edit_item_err_text(err), show_alert=True)
+            return
+        old = item.item_category
+        item.item_category = new_cat
+        if old != item.item_category:
+            item.display_order = await next_display_order_for_group(
+                session, bool(item.is_paid), item.item_category
+            )
+        await session.commit()
+    try:
+        await query.message.edit_text(
+            _edit_item_header_html(item),
+            reply_markup=edit_item_menu_keyboard(iid, is_paid=bool(item.is_paid)),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        await query.message.answer(
+            _edit_item_header_html(item),
+            reply_markup=edit_item_menu_keyboard(iid, is_paid=bool(item.is_paid)),
+            parse_mode=ParseMode.HTML,
+        )
+    await query.answer("Категория обновлена.")
+
+
+@router.message(EditItemStates.name, F.text)
+async def edit_item_name(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    if iid is None:
+        await state.clear()
+        return
+    name = (message.text or "").strip()
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            int(iid),
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await state.clear()
+            await message.answer(_edit_item_err_text(err))
+            return
+        item.name = name
+        await session.commit()
+        paid = bool(item.is_paid)
+    await state.clear()
+    await message.answer(
+        "Название обновлено.",
+        reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
+    )
+
+
+@router.message(EditItemStates.description, F.text)
+async def edit_item_description(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    if iid is None:
+        await state.clear()
+        return
+    desc = (message.text or "").strip()
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            int(iid),
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await state.clear()
+            await message.answer(_edit_item_err_text(err))
+            return
+        item.description = desc
+        await session.commit()
+        paid = bool(item.is_paid)
+    await state.clear()
+    await message.answer(
+        "Описание обновлено.",
+        reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
+    )
+
+
+@router.message(EditItemStates.photos, Command("done"))
+async def edit_item_photos_done(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    if iid is None:
+        await state.clear()
+        return
+    photos: list[str] = list(data.get("photos") or [])
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            int(iid),
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await state.clear()
+            await message.answer(_edit_item_err_text(err))
+            return
+        item.photos_json = json.dumps(photos, ensure_ascii=False)
+        await session.commit()
+        paid = bool(item.is_paid)
+    await state.clear()
+    await message.answer(
+        "Фото обновлены.",
+        reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
+    )
+
+
+@router.message(EditItemStates.photos, F.photo)
+async def edit_item_photo_collect(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    photos: list[str] = list(data.get("photos") or [])
+    fid = message.photo[-1].file_id
+    photos.append(fid)
+    await state.update_data(photos=photos)
+    await message.answer("Фото добавлено. Ещё фото или /done")
+
+
+@router.message(EditItemStates.rent_hours_min, F.text)
+async def edit_item_rent_hours_min(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    if iid is None:
+        await state.clear()
+        return
+    try:
+        n = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число часов (от 1 до 168).")
+        return
+    if n < 1 or n > MAX_RENT_HOURS:
+        await message.answer(f"Укажите число от 1 до {MAX_RENT_HOURS}.")
+        return
+    await state.update_data(rent_hours_min=n)
+    await state.set_state(EditItemStates.rent_hours_max)
+    await message.answer(
+        f"Максимальный срок аренды в часах "
+        f"(не меньше {n}, не больше {MAX_RENT_HOURS}):"
+    )
+
+
+@router.message(EditItemStates.rent_hours_max, F.text)
+async def edit_item_rent_hours_max(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    flow = data.get("edit_flow", "rent")
+    n = data.get("rent_hours_min")
+    if iid is None or n is None:
+        await state.clear()
+        return
+    try:
+        m = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число часов.")
+        return
+    if m < int(n) or m > MAX_RENT_HOURS:
+        await message.answer(f"Допустимо от {n} до {MAX_RENT_HOURS} ч.")
+        return
+
+    if flow == "topaid":
+        await state.update_data(rent_hours_max=m)
+        await state.set_state(EditItemStates.price_hour)
+        await message.answer("Введите цену за час (число, например 100):")
+        return
+
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            int(iid),
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await state.clear()
+            await message.answer(_edit_item_err_text(err))
+            return
+        item.rent_hours_min = int(n)
+        item.rent_hours_max = m
+        await session.commit()
+        paid = bool(item.is_paid)
+    await state.clear()
+    await message.answer(
+        "Сроки аренды обновлены.",
+        reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
+    )
+
+
+@router.message(EditItemStates.price_hour, F.text)
+async def edit_item_price_hour(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        v = Decimal(message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await message.answer("Нужно число. Повторите цену за час:")
+        return
+    await state.update_data(price_hour=str(v))
+    await state.set_state(EditItemStates.price_day)
+    await message.answer("Цена за сутки (24 часа):")
+
+
+@router.message(EditItemStates.price_day, F.text)
+async def edit_item_price_day(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        v = Decimal(message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await message.answer("Нужно число. Повторите цену за сутки:")
+        return
+    await state.update_data(price_day=str(v))
+    await state.set_state(EditItemStates.price_week)
+    await message.answer("Цена за неделю (168 часов):")
+
+
+@router.message(EditItemStates.price_week, F.text)
+async def edit_item_price_week(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        v = Decimal(message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await message.answer("Нужно число. Повторите цену за неделю:")
+        return
+    data = await state.get_data()
+    iid = data.get("edit_item_id")
+    flow = data.get("edit_flow")
+    if iid is None or flow not in ("prices", "topaid"):
+        await state.clear()
+        return
+    async with db_session.async_session_maker() as session:
+        item, err = await _require_editable_item(
+            session,
+            int(iid),
+            message.from_user.id,
+            message.from_user.username,
+            settings,
+        )
+        if err or item is None:
+            await state.clear()
+            await message.answer(_edit_item_err_text(err))
+            return
+        if flow == "prices":
+            if not item.is_paid:
+                await state.clear()
+                await message.answer("Вещь не в платной аренде — цены не сохранены.")
+                return
+            item.price_hour = Decimal(data["price_hour"])
+            item.price_day = Decimal(data["price_day"])
+            item.price_week = v
+        else:
+            item.rent_hours_min = int(data["rent_hours_min"])
+            item.rent_hours_max = int(data["rent_hours_max"])
+            item.price_hour = Decimal(data["price_hour"])
+            item.price_day = Decimal(data["price_day"])
+            item.price_week = v
+            item.is_paid = True
+            item.display_order = await next_display_order_for_group(
+                session, True, item.item_category
+            )
+        await session.commit()
+        paid = bool(item.is_paid)
+    await state.clear()
+    done = (
+        "Цены обновлены."
+        if flow == "prices"
+        else "Вещь переведена в платную аренду."
+    )
+    await message.answer(
+        done,
+        reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
+    )
+
+
 @router.message(Command("list_items"))
 async def cmd_list_items(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
@@ -524,7 +1127,12 @@ async def cmd_list_items(message: Message, settings: Settings) -> None:
         ic = item_category_label(it.item_category)
         lo, hi = rent_hours_bounds(it)
         lines.append(f"{it.id}. {it.name} ({cat} | {lo}–{hi}ч | {ic}{own})")
-    await message.answer("Ваши и общие вещи:\n" + "\n".join(lines))
+    await message.answer(
+        "Ваши и общие вещи:\n"
+        + "\n".join(lines)
+        + "\n\n<i>Редактировать поля вещи: /edit_item id</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("delete_item"))

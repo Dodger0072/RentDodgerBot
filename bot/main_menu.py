@@ -31,8 +31,8 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
     extra = ""
     if is_admin(message.from_user.id, message.from_user.username, settings):
         extra = (
-            "\n\nАдмин: /add_item — добавить вещь, /list_items, /item_order id позиция, /delete_item (id); "
-            "/bookings, /add_blackout; /list_blackouts, /delete_blackout id; /delete_item — свои вещи (общие — суперадмин); "
+            "\n\nАдмин: /add_item — добавить вещь, /list_items, /edit_item id, /item_order id позиция, /delete_item id; "
+            "/bookings, /add_blackout; /list_blackouts, /delete_blackout id; "
             "/ban @name [причина], /unban @name, /list_bans."
         )
     await message.answer(

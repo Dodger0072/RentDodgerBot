@@ -14,6 +14,19 @@ class AddItemStates(StatesGroup):
     price_week = State()
 
 
+class EditItemStates(StatesGroup):
+    """Пошаговое изменение полей существующей вещи (/edit_item)."""
+
+    name = State()
+    description = State()
+    photos = State()
+    rent_hours_min = State()
+    rent_hours_max = State()
+    price_hour = State()
+    price_day = State()
+    price_week = State()
+
+
 class UserRentStates(StatesGroup):
     waiting_hours = State()
     waiting_confirm = State()
