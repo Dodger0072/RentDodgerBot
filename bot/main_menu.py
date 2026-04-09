@@ -8,7 +8,7 @@ from bot.config import Settings, is_admin
 from bot.db import session as db_session
 from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.services.user_bot_state import mark_main_menu_seen, user_main_menu_seen
-from bot.keyboards.inline import category_keyboard
+from bot.keyboards.inline import category_keyboard_for_admin
 from bot.keyboards.reply import remove_reply_keyboard
 
 _RENTAL_TYPES_INFO = (
@@ -35,9 +35,10 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
             "/bookings, /drop_request item_id, /add_blackout; /list_blackouts, /delete_blackout id; "
             "/warn, /list_bans; бан/разбан — только суперадмин (если задан SUPERADMIN_USER_IDS)."
         )
+    admin_user = is_admin(message.from_user.id, message.from_user.username, settings)
     await message.answer(
         _RENTAL_TYPES_INFO + extra,
-        reply_markup=category_keyboard(),
+        reply_markup=category_keyboard_for_admin(is_admin_user=admin_user),
         parse_mode=ParseMode.HTML,
     )
     footer = (

@@ -19,12 +19,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
-from bot.config import Settings
+from bot.config import Settings, is_admin
 from bot.time_format import format_local_time
 from bot.db.models import Item, Rental, RentalState, Reservation
 from bot.db import session as db_session
 from bot.item_categories import UNCATEGORIZED_SLUG, item_category_label
 from bot.keyboards.inline import (
+    category_keyboard_for_admin,
     category_keyboard,
     confirm_keyboard,
     home_keyboard,
@@ -482,9 +483,14 @@ async def user_back_to_inventory_list(query: CallbackQuery, state: FSMContext, s
 
 
 @router.callback_query(F.data == "u:back")
-async def user_back(query: CallbackQuery, state: FSMContext) -> None:
+async def user_back(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     await state.clear()
-    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
+    await query.message.answer(
+        "Выберите каталог:",
+        reply_markup=category_keyboard_for_admin(
+            is_admin_user=is_admin(query.from_user.id, query.from_user.username, settings)
+        ),
+    )
     await query.answer()
 
 
@@ -556,9 +562,14 @@ async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Setti
 
 
 @router.callback_query(F.data == "u:home")
-async def user_home(query: CallbackQuery, state: FSMContext) -> None:
+async def user_home(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     await state.clear()
-    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
+    await query.message.answer(
+        "Выберите каталог:",
+        reply_markup=category_keyboard_for_admin(
+            is_admin_user=is_admin(query.from_user.id, query.from_user.username, settings)
+        ),
+    )
     await query.answer()
 
 

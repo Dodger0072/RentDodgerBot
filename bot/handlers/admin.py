@@ -33,9 +33,11 @@ from bot.db.models import (
 )
 from bot.db import session as db_session
 from bot.keyboards.inline import (
+    admin_panel_keyboard,
     admin_hours_keyboard,
     admin_item_category_keyboard,
     admin_rental_decision_keyboard,
+    category_keyboard_for_admin,
     edit_item_category_keyboard,
     edit_item_menu_keyboard,
 )
@@ -101,6 +103,267 @@ def _omit_fsm_keys(d: dict, *keys: str) -> dict:
 
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
     return is_admin(user_id, username, settings)
+
+
+def _admin_panel_pick_item_keyboard(
+    items: list[Item], *, mode: str, uid: int, settings: Settings
+) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    for it in items:
+        tag = "платн." if it.is_paid else "беспл."
+        owner = "общая" if it.owner_user_id is None else "ваша"
+        if it.owner_user_id is not None and it.owner_user_id != uid:
+            owner = "чужая"
+        if mode == "delete" and it.owner_user_id is None and not is_superadmin(uid, settings):
+            owner = "общая (только суперадмин)"
+        b.row(
+            InlineKeyboardButton(
+                text=f"#{it.id} {it.name} ({tag}, {owner})",
+                callback_data=f"adm:panel:{mode}:{it.id}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Назад в панель", callback_data="adm:panel"))
+    return b
+
+
+async def _show_admin_item_picker(
+    target: Message, *, mode: str, uid: int, settings: Settings
+) -> None:
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(select(Item).order_by(Item.display_order.asc(), Item.id.asc()))
+        all_items = list(r.scalars().unique())
+        await session.commit()
+    if mode == "edit":
+        items = [it for it in all_items if admin_can_edit_item(uid, it, settings)]
+        if not items:
+            await target.answer("Нет вещей, доступных для редактирования.")
+            return
+        kb = _admin_panel_pick_item_keyboard(items, mode="edit", uid=uid, settings=settings)
+        await target.answer("Выберите вещь для редактирования:", reply_markup=kb.as_markup())
+        return
+    items = [it for it in all_items if admin_can_delete_item(uid, it, settings)]
+    if not items:
+        await target.answer("Нет вещей, доступных для удаления.")
+        return
+    kb = _admin_panel_pick_item_keyboard(items, mode="delete", uid=uid, settings=settings)
+    await target.answer("Выберите вещь для удаления:", reply_markup=kb.as_markup())
+
+
+def _admin_panel_blackout_keyboard(
+    rows: list[tuple[int, datetime, datetime, str]], settings: Settings
+) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    for bid, start_at, end_at, title in rows:
+        b.row(
+            InlineKeyboardButton(
+                text=f"#{bid} {title}: {format_local_time(start_at, settings)} - {format_local_time(end_at, settings)}",
+                callback_data=f"adm:panel:delblackout:{bid}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Назад в панель", callback_data="adm:panel"))
+    return b
+
+
+async def _show_admin_blackout_picker(target: Message, *, uid: int, settings: Settings) -> None:
+    now = datetime.now(UTC)
+    rows: list[tuple[int, datetime, datetime, str]] = []
+    async with db_session.async_session_maker() as session:
+        r_w = await session.execute(
+            select(AdminBlackoutWindow).where(
+                AdminBlackoutWindow.owner_user_id == uid,
+                AdminBlackoutWindow.end_at > now,
+            )
+        )
+        windows = list(r_w.scalars().unique())
+        for w in windows:
+            rows.append((w.id, w.start_at, w.end_at, "общее окно"))
+
+        r_b = await session.execute(
+            select(ItemBlackout)
+            .options(selectinload(ItemBlackout.item))
+            .where(
+                ItemBlackout.window_id.is_(None),
+                ItemBlackout.end_at > now,
+            )
+        )
+        legacy = list(r_b.scalars().unique())
+        await session.commit()
+    for bo in legacy:
+        if not admin_manages_item(uid, bo.item):
+            continue
+        name = escape(bo.item.name if bo.item else "?")
+        rows.append((bo.id, bo.start_at, bo.end_at, f"одна вещь ({name})"))
+    rows.sort(key=lambda x: x[1])
+    if not rows:
+        await target.answer("Нет окон неактива для удаления.")
+        return
+    kb = _admin_panel_blackout_keyboard(rows, settings)
+    await target.answer("Выберите окно неактива для удаления:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "adm:panel")
+async def admin_open_panel(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await query.message.answer("Панель администратора:", reply_markup=admin_panel_keyboard())
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:panel:([^:]+)$"))
+async def admin_panel_action(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    action = (query.data or "").split(":")[2]
+    await query.answer()
+    if action == "add_item":
+        await cmd_add_item(query.message, state, settings)
+        return
+    if action == "list_items":
+        await cmd_list_items(query.message, settings)
+        return
+    if action == "pick_edit":
+        await _show_admin_item_picker(
+            query.message, mode="edit", uid=query.from_user.id, settings=settings
+        )
+        return
+    if action == "pick_delete":
+        await _show_admin_item_picker(
+            query.message, mode="delete", uid=query.from_user.id, settings=settings
+        )
+        return
+    if action == "bookings":
+        await cmd_bookings(query.message, settings)
+        return
+    if action == "rent_stats":
+        await cmd_rent_stats(query.message, settings)
+        return
+    if action == "add_blackout":
+        await cmd_add_blackout(query.message, state, settings)
+        return
+    if action == "list_blackouts":
+        await cmd_list_blackouts(query.message, settings)
+        return
+    if action == "pick_delete_blackout":
+        await _show_admin_blackout_picker(query.message, uid=query.from_user.id, settings=settings)
+        return
+    if action == "list_bans":
+        await cmd_list_bans(query.message, settings)
+        return
+    if action == "list_warnings":
+        await cmd_list_warnings(query.message, settings)
+        return
+    await query.message.answer(
+        "Неизвестный пункт панели. Откройте панель заново.",
+        reply_markup=category_keyboard_for_admin(is_admin_user=True),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^adm:panel:(edit|delete):(\d+)$"))
+async def admin_panel_item_action(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    mode = parts[2]
+    item_id = int(parts[3])
+    await query.answer()
+
+    if mode == "edit":
+        await state.clear()
+        async with db_session.async_session_maker() as session:
+            item, err = await _require_editable_item(
+                session,
+                item_id,
+                query.from_user.id,
+                query.from_user.username,
+                settings,
+            )
+            if err:
+                await query.message.answer(_edit_item_err_text(err))
+                return
+        await query.message.answer(
+            _edit_item_header_html(item),
+            reply_markup=edit_item_menu_keyboard(item.id, is_paid=bool(item.is_paid)),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(select(Item).where(Item.id == item_id))
+        item = r.scalar_one_or_none()
+        if item is None:
+            await query.message.answer("Вещь не найдена.")
+            return
+        if not admin_can_delete_item(query.from_user.id, item, settings):
+            await session.rollback()
+            if item.owner_user_id is None:
+                await query.message.answer(
+                    "Общую вещь без владельца может удалить только суперадмин."
+                )
+            else:
+                await query.message.answer("Удалить может только владелец вещи или суперадмин.")
+            return
+        name = item.name
+        await session.delete(item)
+        await session.commit()
+    await state.clear()
+    await query.message.answer(f"Вещь удалена: {name}")
+
+
+@router.callback_query(F.data.regexp(r"^adm:panel:delblackout:(\d+)$"))
+async def admin_panel_delete_blackout(query: CallbackQuery, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    bid = int((query.data or "").split(":")[3])
+    uid = query.from_user.id
+    await query.answer()
+    async with db_session.async_session_maker() as session:
+        w = await session.get(AdminBlackoutWindow, bid)
+        if w is not None:
+            if w.owner_user_id != uid:
+                await session.rollback()
+                await query.message.answer("Такого общего окна нет или оно создано другим администратором.")
+                return
+            await session.delete(w)
+            await session.commit()
+            await query.message.answer(f"Окно неактива #{bid} удалено со всех вещей.")
+            return
+        r = await session.execute(
+            select(ItemBlackout)
+            .options(selectinload(ItemBlackout.item))
+            .where(ItemBlackout.id == bid)
+        )
+        bo = r.scalar_one_or_none()
+        if bo is None:
+            await session.rollback()
+            await query.message.answer("Запись не найдена.")
+            return
+        if bo.window_id is not None:
+            w2 = await session.get(AdminBlackoutWindow, bo.window_id)
+            if w2 is not None and w2.owner_user_id == uid:
+                wid = w2.id
+                await session.delete(w2)
+                await session.commit()
+                await query.message.answer(f"Окно неактива #{wid} удалено со всех вещей.")
+                return
+            await session.rollback()
+            await query.message.answer("Удаляйте по id общего окна из /list_blackouts.")
+            return
+        if not admin_manages_item(uid, bo.item):
+            await session.rollback()
+            await query.message.answer("Это окно на чужой вещи.")
+            return
+        await session.delete(bo)
+        await session.commit()
+    await query.message.answer(f"Окно неактива #{bid} удалено.")
 
 
 async def _require_editable_item(
@@ -1597,7 +1860,7 @@ async def cmd_add_blackout(message: Message, state: FSMContext, settings: Settin
         return
     await state.set_state(AdminBlackoutStates.waiting_start)
     await message.answer(
-        "Окно недоступности для <b>всех ваших управляемых вещей</b>.\n\n"
+        "Окно неактива для <b>всех ваших управляемых вещей</b>.\n\n"
         "Будут сняты <b>брони</b> и <b>ожидающие выдачи заявки</b>, у которых "
         "<b>начало слота</b> попадает в это окно (если начало раньше окна, а дальше слот только пересекается — "
         "бронь остаётся).\n\n"
@@ -1684,7 +1947,7 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
     if len(names) > 12:
         preview += f"… (+{len(names) - 12})"
     await message.answer(
-        f"Окно недоступности добавлено для <b>{len(names)}</b> вещей: {preview}\n"
+        f"Окно неактива добавлено для <b>{len(names)}</b> вещей: {preview}\n"
         f"Интервал: {format_local_time(start_at, settings)} — {format_local_time(end_at, settings)}.\n"
         f"В <code>/list_blackouts</code> — <b>один</b> id на всё это окно; <code>/delete_blackout</code> снимет его со всех вещей.\n"
         f"Снято броней: {n_res}, заявок на выдачу (ожидают админа): {n_rent}.",
@@ -1724,7 +1987,7 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
         await session.commit()
     legacy = [bo for bo in legacy if admin_manages_item(uid, bo.item)]
     if not windows and not legacy:
-        await message.answer("Предстоящих окон недоступности по вашим вещам нет.")
+        await message.answer("Предстоящих окон неактива по вашим вещам нет.")
         return
     chunks: list[tuple[datetime, str]] = []
     for w in windows:
@@ -1749,7 +2012,7 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
     chunks.sort(key=lambda x: x[0])
     lines = [c[1] for c in chunks]
     text = (
-        "<b>Предстоящие окна недоступности выдачи</b>\n"
+        "<b>Предстоящие окна неактива выдачи</b>\n"
         "<i>Окно из /add_blackout — одна строка и один id на все вещи; «одна вещь» — только старые записи. Прошедшие не показываются.</i>\n\n"
         + "\n\n".join(lines)
     )
@@ -1813,7 +2076,7 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
             return
         await session.delete(bo)
         await session.commit()
-    await message.answer(f"Окно недоступности #{bid} удалено.")
+    await message.answer(f"Окно неактива #{bid} удалено.")
 
 
 def _booking_line_reservation(res: Reservation, settings: Settings) -> str:
@@ -1970,15 +2233,18 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
         if item_id != current_item_id:
             current_item_id = item_id
             item_name = "?"
+            category_name = item_category_label(None)
             if kind == "res":
                 assert isinstance(obj, Reservation)
                 item_name = escape(obj.item.name if obj.item else "?")
+                category_name = escape(item_category_label(obj.item.item_category if obj.item else None))
             else:
                 assert isinstance(obj, Rental)
                 item_name = escape(obj.item.name if obj.item else "?")
+                category_name = escape(item_category_label(obj.item.item_category if obj.item else None))
             if full_lines:
                 full_lines.append("")
-            full_lines.append(f"<b>Аксессуар: {item_name}</b>")
+            full_lines.append(f"<b>Категория: {category_name}</b> — {item_name}")
         if kind == "res":
             assert isinstance(obj, Reservation)
             full_lines.append(_booking_line_reservation(obj, settings))

@@ -70,6 +70,34 @@ def category_keyboard() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def category_keyboard_for_admin(*, is_admin_user: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="Платная аренда", callback_data="cat:paid"),
+        InlineKeyboardButton(text="Бесплатная аренда", callback_data="cat:free"),
+    )
+    if is_admin_user:
+        b.row(InlineKeyboardButton(text="Админ-панель", callback_data="adm:panel"))
+    return b.as_markup()
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="Добавить вещь", callback_data="adm:panel:add_item"))
+    b.row(InlineKeyboardButton(text="Мои вещи", callback_data="adm:panel:list_items"))
+    b.row(InlineKeyboardButton(text="Редактировать вещь", callback_data="adm:panel:pick_edit"))
+    b.row(InlineKeyboardButton(text="Удалить вещь", callback_data="adm:panel:pick_delete"))
+    b.row(InlineKeyboardButton(text="Брони и аренды", callback_data="adm:panel:bookings"))
+    b.row(InlineKeyboardButton(text="Статистика", callback_data="adm:panel:rent_stats"))
+    b.row(InlineKeyboardButton(text="Добавить окно неактива", callback_data="adm:panel:add_blackout"))
+    b.row(InlineKeyboardButton(text="Список окон неактива", callback_data="adm:panel:list_blackouts"))
+    b.row(InlineKeyboardButton(text="Удалить окно неактива", callback_data="adm:panel:pick_delete_blackout"))
+    b.row(InlineKeyboardButton(text="Баны", callback_data="adm:panel:list_bans"))
+    b.row(InlineKeyboardButton(text="Предупреждения", callback_data="adm:panel:list_warnings"))
+    b.row(InlineKeyboardButton(text="« К каталогу", callback_data="u:home"))
+    return b.as_markup()
+
+
 def home_keyboard() -> InlineKeyboardMarkup:
     """Корень каталога (платная/бесплатная). Callback: u:home — после успешной брони/заявки."""
     b = InlineKeyboardBuilder()
