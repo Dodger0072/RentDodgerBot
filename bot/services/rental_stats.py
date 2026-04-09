@@ -48,23 +48,27 @@ def _stats_rows_for_admin(admin_user_id: int):
 
 
 async def fetch_rental_stats(
-    session: AsyncSession, settings: Settings, *, admin_user_id: int
+    session: AsyncSession, settings: Settings, *, admin_user_id: int, item_id: int | None = None
 ) -> RentalStatsSnapshot:
     today_start, week_start, month_start = _utc_range_today_week_month(settings)
     now_utc = datetime.now(UTC)
     scope = _stats_rows_for_admin(admin_user_id)
 
+    item_filter = []
+    if item_id is not None:
+        item_filter.append(RentalHandoverStat.item_id == int(item_id))
+
     total = await session.scalar(
         select(func.coalesce(func.sum(RentalHandoverStat.amount), 0))
         .select_from(RentalHandoverStat)
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
-        .where(scope)
+        .where(scope, *item_filter)
     )
     cnt = await session.scalar(
         select(func.count())
         .select_from(RentalHandoverStat)
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
-        .where(scope)
+        .where(scope, *item_filter)
     )
 
     earned_today = await session.scalar(
@@ -73,6 +77,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= today_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -83,6 +88,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= week_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -93,6 +99,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= month_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -104,6 +111,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= today_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -114,6 +122,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= week_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )
@@ -124,6 +133,7 @@ async def fetch_rental_stats(
         .outerjoin(Item, RentalHandoverStat.item_id == Item.id)
         .where(
             scope,
+            *item_filter,
             RentalHandoverStat.handed_over_at >= month_start,
             RentalHandoverStat.handed_over_at <= now_utc,
         )

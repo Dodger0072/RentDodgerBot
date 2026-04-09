@@ -1817,26 +1817,22 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
 
 
 def _booking_line_reservation(res: Reservation, settings: Settings) -> str:
-    item = res.item
-    name = escape(item.name if item else "?")
     un = escape((res.username or "—").lstrip("@"))
     return (
-        f"• <b>[бронь] #{res.id}</b> {name} | @{un} | "
+        f"• <b>[бронь] #{res.id}</b> @{un} | "
         f"{format_local_time(res.start_at, settings)} → "
         f"{format_local_time(res.end_at, settings)} | {res.requested_hours} ч."
     )
 
 
 def _booking_line_rental(rent: Rental, settings: Settings) -> str:
-    item = rent.item
-    name = escape(item.name if item else "?")
     un = escape((rent.username or "—").lstrip("@"))
     st = ensure_utc(rent.start_at)
     en = ensure_utc(rent.end_at)
     start_l = format_local_time(st, settings) if st else "?"
     end_l = format_local_time(en, settings) if en else "?"
     return (
-        f"• <b>[аренда] #{rent.id}</b> {name} | @{un} | "
+        f"• <b>[аренда] #{rent.id}</b> @{un} | "
         f"{start_l} → {end_l} | {rent.requested_hours} ч."
     )
 
@@ -1870,6 +1866,48 @@ def _booking_sort_key_reservation(res: Reservation) -> datetime:
 def _booking_sort_key_rental(rent: Rental) -> datetime:
     st = ensure_utc(rent.start_at)
     return st or datetime.min.replace(tzinfo=UTC)
+
+
+def _rent_stats_text(
+    snap, settings: Settings, *, title: str, include_scope_note: bool = True
+) -> str:
+    tz_hint = escape(settings.time_zone_label.strip() or "локальному времени бота")
+    text = (
+        f"<b>{title}</b> <i>(сегодня / неделя / месяц — границы по {tz_hint})</i>\n\n"
+        f"Заработано с аренды всего: {format_money(snap.earned_total)}\n"
+        f"За сегодня: {format_money(snap.earned_today)}\n"
+        f"За неделю: {format_money(snap.earned_week)}\n"
+        f"За месяц: {format_money(snap.earned_month)}\n\n"
+        f"Сдано аксессуаров всего: {snap.handovers_total}\n"
+        f"За сегодня: {snap.handovers_today}\n"
+        f"За неделю: {snap.handovers_week}\n"
+        f"За месяц: {snap.handovers_month}"
+    )
+    if include_scope_note:
+        text += (
+            "\n\n<i>Только ваши выдачи: по подтвердившему админу; для старых записей без этого поля — "
+            "по владельцу вещи на момент просмотра (общие вещи без владельца в персональную статистику "
+            "не попадают). Учёт с момента появления функции; аренды после срока бот удаляет — "
+            "в прошлое не восстанавливаются.</i>"
+        )
+    return text
+
+
+def _rent_stats_item_keyboard(items: list[Item], selected_item_id: int | None = None):
+    kb = InlineKeyboardBuilder()
+    if selected_item_id is not None:
+        kb.row(InlineKeyboardButton(text="<< Общая статистика", callback_data="adm:rst:all"))
+    for item in items:
+        title = escape(item.name)
+        if item.id == selected_item_id:
+            title = f"• {title}"
+        kb.row(
+            InlineKeyboardButton(
+                text=title[:64],
+                callback_data=f"adm:rst:item:{item.id}",
+            )
+        )
+    return kb.as_markup()
 
 
 @router.message(Command("bookings"))
@@ -1912,12 +1950,14 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
         and admin_manages_item(uid, x.item)
     ]
 
-    typed_rows: list[tuple[datetime, str, Reservation | Rental]] = []
+    typed_rows: list[tuple[int, str, datetime, Reservation | Rental]] = []
     for res in upcoming_res:
-        typed_rows.append((_booking_sort_key_reservation(res), "res", res))
+        item_id = res.item.id if res.item is not None else 0
+        typed_rows.append((item_id, "res", _booking_sort_key_reservation(res), res))
     for rent in active_rent:
-        typed_rows.append((_booking_sort_key_rental(rent), "rt", rent))
-    typed_rows.sort(key=lambda x: x[0])
+        item_id = rent.item.id if rent.item is not None else 0
+        typed_rows.append((item_id, "rt", _booking_sort_key_rental(rent), rent))
+    typed_rows.sort(key=lambda x: (x[0], x[2], x[1]))
 
     if not typed_rows:
         await message.answer("Нет записей: ни будущих броней, ни действующих аренд.")
@@ -1925,7 +1965,20 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
 
     full_lines: list[str] = []
     full_kb_keys: list[tuple[str, int]] = []
-    for _, kind, obj in typed_rows:
+    current_item_id: int | None = None
+    for item_id, kind, _, obj in typed_rows:
+        if item_id != current_item_id:
+            current_item_id = item_id
+            item_name = "?"
+            if kind == "res":
+                assert isinstance(obj, Reservation)
+                item_name = escape(obj.item.name if obj.item else "?")
+            else:
+                assert isinstance(obj, Rental)
+                item_name = escape(obj.item.name if obj.item else "?")
+            if full_lines:
+                full_lines.append("")
+            full_lines.append(f"<b>Аксессуар: {item_name}</b>")
         if kind == "res":
             assert isinstance(obj, Reservation)
             full_lines.append(_booking_line_reservation(obj, settings))
@@ -2007,24 +2060,73 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     uid = message.from_user.id
     async with db_session.async_session_maker() as session:
         snap = await fetch_rental_stats(session, settings, admin_user_id=uid)
+        r_items = await session.execute(select(Item).order_by(Item.id.asc()))
+        all_items = list(r_items.scalars().unique())
+        managed_items = [x for x in all_items if admin_manages_item(uid, x)]
         await session.commit()
-    tz_hint = escape(settings.time_zone_label.strip() or "локальному времени бота")
-    text = (
-        f"<b>Ваша статистика аренды</b> <i>(сегодня / неделя / месяц — границы по {tz_hint})</i>\n\n"
-        f"Заработано с аренды всего: {format_money(snap.earned_total)}\n"
-        f"За сегодня: {format_money(snap.earned_today)}\n"
-        f"За неделю: {format_money(snap.earned_week)}\n"
-        f"За месяц: {format_money(snap.earned_month)}\n\n"
-        f"Сдано аксессуаров всего: {snap.handovers_total}\n"
-        f"За сегодня: {snap.handovers_today}\n"
-        f"За неделю: {snap.handovers_week}\n"
-        f"За месяц: {snap.handovers_month}\n\n"
-        "<i>Только ваши выдачи: по подтвердившему админу; для старых записей без этого поля — "
-        "по владельцу вещи на момент просмотра (общие вещи без владельца в персональную статистику "
-        "не попадают). Учёт с момента появления функции; аренды после срока бот удаляет — "
-        "в прошлое не восстанавливаются.</i>"
+    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды")
+    kb = _rent_stats_item_keyboard(managed_items) if managed_items else None
+    if managed_items:
+        text += "\n\nВыберите аксессуар, чтобы посмотреть статистику по нему:"
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.callback_query(F.data == "adm:rst:all")
+async def admin_rent_stats_all(query: CallbackQuery, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    uid = query.from_user.id
+    async with db_session.async_session_maker() as session:
+        snap = await fetch_rental_stats(session, settings, admin_user_id=uid)
+        r_items = await session.execute(select(Item).order_by(Item.id.asc()))
+        all_items = list(r_items.scalars().unique())
+        managed_items = [x for x in all_items if admin_manages_item(uid, x)]
+        await session.commit()
+    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды")
+    if managed_items:
+        text += "\n\nВыберите аксессуар, чтобы посмотреть статистику по нему:"
+    await query.message.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_rent_stats_item_keyboard(managed_items) if managed_items else None,
     )
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:rst:item:(\d+)$"))
+async def admin_rent_stats_by_item(query: CallbackQuery, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    item_id = int(query.data.split(":")[3])
+    uid = query.from_user.id
+    async with db_session.async_session_maker() as session:
+        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        item = r_item.scalar_one_or_none()
+        if item is None:
+            await session.rollback()
+            await query.answer("Аксессуар не найден", show_alert=True)
+            return
+        if not admin_manages_item(uid, item):
+            await session.rollback()
+            await query.answer("Это не ваш аксессуар", show_alert=True)
+            return
+        snap = await fetch_rental_stats(session, settings, admin_user_id=uid, item_id=item_id)
+        r_items = await session.execute(select(Item).order_by(Item.id.asc()))
+        all_items = list(r_items.scalars().unique())
+        managed_items = [x for x in all_items if admin_manages_item(uid, x)]
+        await session.commit()
+
+    title = f"Статистика по аксессуару: {escape(item.name)}"
+    text = _rent_stats_text(snap, settings, title=title, include_scope_note=False)
+    text += "\n\n<i>Выдачи считаются по выбранному аксессуару.</i>"
+    await query.message.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_rent_stats_item_keyboard(managed_items, selected_item_id=item_id),
+    )
+    await query.answer()
 
 
 @router.callback_query(F.data == "adm:res:abort")

@@ -5,6 +5,7 @@ ITEM_CATEGORIES: list[tuple[str, str]] = [
     ("transport", "Транспорт"),
     ("lodging", "Подселение"),
     ("accessories", "Аксессуары"),
+    ("skins", "Скины"),
     ("guards", "Охранники"),
     ("work_sets", "Сета для работ"),
 ]
