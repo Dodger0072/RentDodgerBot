@@ -1951,6 +1951,55 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
+@router.message(Command("drop_request", "drop_pending"))
+async def cmd_drop_pending_request(message: Message, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: /drop_request 5 — где 5 это id вещи из /list_items.\n"
+            "Команда вручную снимает зависшую заявку на выдачу (ожидает админа)."
+        )
+        return
+    try:
+        item_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("Нужен числовой id вещи.")
+        return
+
+    async with db_session.async_session_maker() as session:
+        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        item = r_item.scalar_one_or_none()
+        if item is None:
+            await session.rollback()
+            await message.answer("Вещь не найдена.")
+            return
+        if not admin_manages_item(message.from_user.id, item):
+            await session.rollback()
+            await message.answer("Это не ваша вещь.")
+            return
+        r_pending = await session.execute(
+            select(Rental).where(
+                Rental.item_id == item_id,
+                Rental.state == RentalState.pending_admin.value,
+            )
+        )
+        pending_rows = list(r_pending.scalars().all())
+        if not pending_rows:
+            await session.rollback()
+            await message.answer("По этой вещи нет зависших заявок в статусе «ожидает админа».")
+            return
+        for row in pending_rows:
+            await session.delete(row)
+        await session.commit()
+
+    await message.answer(
+        f"Снято заявок по вещи #{item_id}: {len(pending_rows)}. "
+        "Вещь снова доступна для новых заявок/брони."
+    )
+
+
 @router.message(Command("rent_stats"))
 async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
