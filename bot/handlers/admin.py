@@ -96,6 +96,22 @@ from sqlalchemy.orm import selectinload
 router = Router(name="admin")
 
 
+class _PanelMessageProxy:
+    """Прокси message для вызова command-хендлеров из callback-кнопок.
+
+    В callback у исходного Message автор — бот. Для проверок прав и логики
+    нужен реальный пользователь из CallbackQuery.from_user.
+    """
+
+    def __init__(self, query: CallbackQuery, text: str = "") -> None:
+        self.from_user = query.from_user
+        self.text = text
+        self._message = query.message
+
+    async def answer(self, *args, **kwargs):
+        return await self._message.answer(*args, **kwargs)
+
+
 def _omit_fsm_keys(d: dict, *keys: str) -> dict:
     drop = set(keys)
     return {k: v for k, v in d.items() if k not in drop}
@@ -220,11 +236,14 @@ async def admin_panel_action(
         return
     action = (query.data or "").split(":")[2]
     await query.answer()
+    msg = _PanelMessageProxy(query)
     if action == "add_item":
-        await cmd_add_item(query.message, state, settings)
+        msg.text = "/add_item"
+        await cmd_add_item(msg, state, settings)
         return
     if action == "list_items":
-        await cmd_list_items(query.message, settings)
+        msg.text = "/list_items"
+        await cmd_list_items(msg, settings)
         return
     if action == "pick_edit":
         await _show_admin_item_picker(
@@ -237,25 +256,31 @@ async def admin_panel_action(
         )
         return
     if action == "bookings":
-        await cmd_bookings(query.message, settings)
+        msg.text = "/bookings"
+        await cmd_bookings(msg, settings)
         return
     if action == "rent_stats":
-        await cmd_rent_stats(query.message, settings)
+        msg.text = "/rent_stats"
+        await cmd_rent_stats(msg, settings)
         return
     if action == "add_blackout":
-        await cmd_add_blackout(query.message, state, settings)
+        msg.text = "/add_blackout"
+        await cmd_add_blackout(msg, state, settings)
         return
     if action == "list_blackouts":
-        await cmd_list_blackouts(query.message, settings)
+        msg.text = "/list_blackouts"
+        await cmd_list_blackouts(msg, settings)
         return
     if action == "pick_delete_blackout":
         await _show_admin_blackout_picker(query.message, uid=query.from_user.id, settings=settings)
         return
     if action == "list_bans":
-        await cmd_list_bans(query.message, settings)
+        msg.text = "/list_bans"
+        await cmd_list_bans(msg, settings)
         return
     if action == "list_warnings":
-        await cmd_list_warnings(query.message, settings)
+        msg.text = "/list_warnings"
+        await cmd_list_warnings(msg, settings)
         return
     await query.message.answer(
         "Неизвестный пункт панели. Откройте панель заново.",
