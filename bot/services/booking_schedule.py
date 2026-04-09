@@ -219,14 +219,34 @@ def max_hours_from_start(
 
 
 def parse_booking_start_text(text: str, settings: Settings) -> datetime | None:
-    """ДД.ММ.ГГГГ ЧЧ:ММ в display_tz → UTC."""
+    """Лояльный парсинг даты/времени в display_tz -> UTC.
+
+    Поддерживает варианты вроде:
+    - 10.04.2026 10:00
+    - 10.04.2026 10.00
+    - 10:04:2026 10:00
+    - 10-04-2026 10-00
+    - 10/04/2026 10:00:30
+    """
     t = (text or "").strip()
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$", t)
+    m = re.match(
+        r"^(\d{1,2})\D+(\d{1,2})\D+(\d{4})\s+(\d{1,2})\D+(\d{1,2})(?:\D+(\d{1,2}))?$",
+        t,
+    )
     if not m:
         return None
-    d, mo, y, h, mi = (int(x) for x in m.groups())
+    d, mo, y, h, mi, sec_raw = m.groups()
+    sec = int(sec_raw) if sec_raw is not None else 0
     try:
-        local = datetime(y, mo, d, h, mi, tzinfo=settings.display_tz)
+        local = datetime(
+            int(y),
+            int(mo),
+            int(d),
+            int(h),
+            int(mi),
+            sec,
+            tzinfo=settings.display_tz,
+        )
     except ValueError:
         return None
     return local.astimezone(UTC)
