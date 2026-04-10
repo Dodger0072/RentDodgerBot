@@ -118,7 +118,9 @@ def _omit_fsm_keys(d: dict, *keys: str) -> dict:
 
 
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
-    return is_admin(user_id, username, settings)
+    # Суперадмин должен иметь доступ ко всем админским командам,
+    # даже если не продублирован в ADMIN_USER_IDS/ADMIN_USERNAMES.
+    return is_admin(user_id, username, settings) or is_superadmin(user_id, settings)
 
 
 def _admin_panel_pick_item_keyboard(
@@ -1468,8 +1470,16 @@ async def cmd_delete_item(message: Message, settings: Settings) -> None:
                     "Удалить может только владелец вещи или суперадмин."
                 )
             return
-        await session.delete(item)
-        await session.commit()
+        try:
+            await session.delete(item)
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            await message.answer(
+                "Не удалось удалить вещь из-за связанных записей (аренды/брони/история). "
+                "Сначала завершите или очистите связанные записи."
+            )
+            return
     await message.answer(f"Вещь {iid} удалена.")
 
 
