@@ -6,6 +6,7 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
@@ -22,6 +23,7 @@ from bot.middlewares import BanMiddleware, SettingsMiddleware
 from bot.services.reservation_reminders import reservation_reminder_loop
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def _public_commands() -> list[BotCommand]:
@@ -69,7 +71,12 @@ async def _setup_bot_commands(bot: Bot, settings) -> None:
         return
     admin_cmds = _admin_commands()
     for uid in admin_ids:
-        await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=uid))
+        try:
+            await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=uid))
+        except TelegramBadRequest as exc:
+            # Если админ ни разу не открывал чат с ботом или id неверный,
+            # Telegram вернёт "chat not found". Не валим запуск всего бота.
+            logger.warning("Skip scoped commands for admin %s: %s", uid, exc)
 
 
 async def main() -> None:
