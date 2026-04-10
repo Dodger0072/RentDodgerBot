@@ -123,6 +123,17 @@ def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
     return is_admin(user_id, username, settings) or is_superadmin(user_id, settings)
 
 
+async def _safe_query_answer(query: CallbackQuery, *args, **kwargs) -> None:
+    """Игнорируем протухшие callback'и, чтобы хендлер не падал."""
+    try:
+        await query.answer(*args, **kwargs)
+    except TelegramBadRequest as exc:
+        low = str(exc).lower()
+        if "query is too old" in low or "query id is invalid" in low:
+            return
+        raise
+
+
 def _admin_panel_pick_item_keyboard(
     items: list[Item], *, mode: str, uid: int, settings: Settings
 ) -> InlineKeyboardBuilder:
@@ -2917,7 +2928,7 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):ok$"))
 async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if not _admin_only(settings, query.from_user.id, query.from_user.username):
-        await query.answer("Нет доступа", show_alert=True)
+        await _safe_query_answer(query, "Нет доступа", show_alert=True)
         return
     rid = int(query.data.split(":")[2])
     async with db_session.async_session_maker() as session:
@@ -2926,10 +2937,10 @@ async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Set
         )
         rental = r.scalar_one_or_none()
         if rental is None or rental.state != RentalState.pending_admin.value:
-            await query.answer("Заявка не найдена или уже обработана", show_alert=True)
+            await _safe_query_answer(query, "Заявка не найдена или уже обработана", show_alert=True)
             return
         if not admin_manages_item(query.from_user.id, rental.item):
-            await query.answer("Это не ваша вещь.", show_alert=True)
+            await _safe_query_answer(query, "Это не ваша вещь.", show_alert=True)
             return
         lo, hi = rent_hours_bounds(rental.item)
     base = query.message.html_text or query.message.text or ""
@@ -2948,7 +2959,7 @@ async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Set
         handover_chat_id=query.message.chat.id,
         handover_message_id=query.message.message_id,
     )
-    await query.answer()
+    await _safe_query_answer(query)
 
 
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):cancel$"))
