@@ -134,7 +134,9 @@ def _catalog_kind_and_slug(item: Item) -> tuple[str, str]:
 
 async def _send_subcategory_choice_menu(message: Message, *, is_paid: bool) -> bool:
     async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item.id).where(Item.is_paid.is_(is_paid)).limit(1))
+        r = await session.execute(
+            select(Item.id).where(Item.is_paid.is_(is_paid), Item.is_visible.is_(True)).limit(1)
+        )
         if r.scalar_one_or_none() is None:
             await session.commit()
             return False
@@ -157,7 +159,7 @@ async def _send_group_inventory_list(
     if not slug or len(slug) > 48 or ":" in slug:
         return False
     async with db_session.async_session_maker() as session:
-        q = select(Item).where(Item.is_paid.is_(is_paid))
+        q = select(Item).where(Item.is_paid.is_(is_paid), Item.is_visible.is_(True))
         if slug == UNCATEGORIZED_SLUG:
             q = q.where(or_(Item.item_category.is_(None), Item.item_category == ""))
         else:
@@ -190,7 +192,9 @@ async def _send_group_inventory_list(
 async def _send_user_item_card(target: Message, item_id: int, settings: Settings) -> None:
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
-        r = await session.execute(select(Item).where(Item.id == item_id))
+        r = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r.scalar_one_or_none()
         if item is None:
             await session.rollback()
@@ -289,7 +293,9 @@ async def _send_rent_hours_prompt(
         await session.commit()
         st = await user_facing_status(session, item_id)
         ref_now = datetime.now(UTC)
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r_item.scalar_one_or_none()
         notice = await near_ban_notice_for_user(session, message.from_user.id)
         await session.commit()
@@ -329,7 +335,9 @@ async def _send_booking_start_prompt(
         )
         return
     async with db_session.async_session_maker() as session:
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         book_item = r_item.scalar_one_or_none()
     if book_item is None:
         await state.clear()
@@ -382,7 +390,9 @@ async def _resend_book_hours_prompt(
         return False
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
-        r = await session.execute(select(Item).where(Item.id == item_id))
+        r = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r.scalar_one_or_none()
         if item is None:
             await session.rollback()
@@ -582,7 +592,9 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
         await session.commit()
         st = await user_facing_status(session, item_id)
         ref_now = datetime.now(UTC)
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r_item.scalar_one_or_none()
         notice = await near_ban_notice_for_user(session, query.from_user.id)
         await session.commit()
@@ -629,7 +641,9 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
         await query.answer("Сначала дождитесь решения администратора по текущей заявке", show_alert=True)
         return
     async with db_session.async_session_maker() as session:
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         book_item = r_item.scalar_one_or_none()
     if book_item is None:
         await query.answer("Вещь не найдена", show_alert=True)
@@ -675,7 +689,9 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
                 reply_markup=home_keyboard(),
             )
             return
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r_item.scalar_one_or_none()
         if item is None:
             await session.rollback()
@@ -745,7 +761,9 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
         )
         return
     async with db_session.async_session_maker() as session:
-        r = await session.execute(select(Item).where(Item.id == item_id))
+        r = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r.scalar_one_or_none()
     if item is None:
         await state.clear()
@@ -813,7 +831,9 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
             await query.answer("Вещь уже недоступна для этой операции", show_alert=True)
             await state.clear()
             return
-        r = await session.execute(select(Item).where(Item.id == item_id))
+        r = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r.scalar_one_or_none()
         if item is None:
             await session.rollback()
@@ -886,7 +906,9 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
         return
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
-        r = await session.execute(select(Item).where(Item.id == item_id))
+        r = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r.scalar_one_or_none()
         if item is None:
             await session.rollback()
@@ -984,7 +1006,9 @@ async def user_book_confirm(
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
         now = datetime.now(UTC)
-        r_item = await session.execute(select(Item).where(Item.id == item_id))
+        r_item = await session.execute(
+            select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
+        )
         item = r_item.scalar_one_or_none()
         if item is None:
             await session.rollback()

@@ -983,7 +983,7 @@ async def edit_item_action_cb(
             item.price_day = None
             item.price_week = None
             item.display_order = await next_display_order_for_group(
-                session, False, item.item_category
+                session, is_paid=False, item_category=item.item_category
             )
             await session.commit()
             try:
@@ -1111,7 +1111,7 @@ async def edit_item_category_cb(query: CallbackQuery, settings: Settings) -> Non
         item.item_category = new_cat
         if old != item.item_category:
             item.display_order = await next_display_order_for_group(
-                session, bool(item.is_paid), item.item_category
+                session, is_paid=bool(item.is_paid), item_category=item.item_category
             )
         await session.commit()
     try:
@@ -1395,7 +1395,7 @@ async def edit_item_price_week(message: Message, state: FSMContext, settings: Se
             item.price_week = v
             item.is_paid = True
             item.display_order = await next_display_order_for_group(
-                session, True, item.item_category
+                session, is_paid=True, item_category=item.item_category
             )
         await session.commit()
         paid = bool(item.is_paid)
@@ -1439,9 +1439,10 @@ async def cmd_list_items(message: Message, settings: Settings) -> None:
                 own += " (удалить: только суперадмин)"
         elif it.owner_user_id == uid:
             own = " | ваша"
+        vis = "" if it.is_visible else " | скрыта"
         ic = item_category_label(it.item_category)
         lo, hi = rent_hours_bounds(it)
-        lines.append(f"{it.id}. {it.name} ({cat} | {lo}–{hi}ч | {ic}{own})")
+        lines.append(f"{it.id}. {it.name} ({cat} | {lo}–{hi}ч | {ic}{own}{vis})")
     await message.answer(
         "Ваши и общие вещи:\n"
         + "\n".join(lines)
@@ -1484,14 +1485,21 @@ async def cmd_delete_item(message: Message, settings: Settings) -> None:
         try:
             await session.delete(item)
             await session.commit()
+            await message.answer(f"Вещь {iid} удалена.")
+            return
         except IntegrityError:
             await session.rollback()
-            await message.answer(
-                "Не удалось удалить вещь из-за связанных записей (аренды/брони/история). "
-                "Сначала завершите или очистите связанные записи."
-            )
-            return
-    await message.answer(f"Вещь {iid} удалена.")
+            r2 = await session.execute(select(Item).where(Item.id == iid))
+            existing = r2.scalar_one_or_none()
+            if existing is None:
+                await message.answer("Вещь уже удалена.")
+                return
+            existing.is_visible = False
+            await session.commit()
+    await message.answer(
+        "Вещь не удалена физически из-за истории, но скрыта из каталога пользователей. "
+        "В истории и статистике запись сохранена."
+    )
 
 
 @router.message(Command("item_order"))

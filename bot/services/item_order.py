@@ -27,7 +27,7 @@ async def non_empty_rental_category_menu_rows(
     """Пары (slug для callback u:grp, подпись кнопки) — только категории, где есть вещи."""
     r = await session.execute(
         select(Item.item_category, func.count(Item.id))
-        .where(Item.is_paid.is_(is_paid))
+        .where(Item.is_paid.is_(is_paid), Item.is_visible.is_(True))
         .group_by(Item.item_category)
     )
     counts: dict[object, int] = {}

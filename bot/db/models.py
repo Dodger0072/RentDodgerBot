@@ -60,6 +60,7 @@ class Item(Base):
     price_day = mapped_column(Numeric(12, 2), nullable=True)
     price_week = mapped_column(Numeric(12, 2), nullable=True)
     is_paid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     owner_user_id = mapped_column(BigInteger, nullable=True)
     owner_username = mapped_column(String(255), nullable=True)
     item_category = mapped_column(String(64), nullable=True)
