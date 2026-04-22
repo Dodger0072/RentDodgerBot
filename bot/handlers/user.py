@@ -584,6 +584,24 @@ async def user_home(query: CallbackQuery, state: FSMContext, settings: Settings)
     await query.answer()
 
 
+@router.callback_query(F.data == "u:be_owner_info")
+async def user_become_owner_info(query: CallbackQuery) -> None:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text="Узнать подробнее",
+            url="https://teletype.in/@dodger0072/Ngzb73srIY0",
+        )
+    )
+    text = (
+        "Если вы желаете сдавать свои вещи, то обратитесь к администратору @Dodger0072.\n\n"
+        "Внимание! Если вы хотите сдавать вещи платно, то с вас будет браться комиссия 10% "
+        "за пользование ботом."
+    )
+    await query.message.answer(text, reply_markup=kb.as_markup())
+    await query.answer()
+
+
 @router.callback_query(F.data.regexp(r"^u:complaint:(ok|rej):(\d+):(\d+)$"))
 async def user_complaint_start(query: CallbackQuery, state: FSMContext) -> None:
     parts = (query.data or "").split(":")

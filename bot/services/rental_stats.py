@@ -8,7 +8,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Item, RentalHandoverStat
+from bot.db.models import Item, RentalHandoverStat, WeeklyInvoice
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,13 @@ class RentalStatsSnapshot:
     handovers_today: int
     handovers_week: int
     handovers_month: int
+
+
+@dataclass(frozen=True)
+class CommissionStatsSnapshot:
+    earned_total: Decimal
+    earned_week: Decimal
+    earned_month: Decimal
 
 
 def _utc_range_today_week_month(settings: Settings, ref_utc: datetime | None = None) -> tuple[datetime, datetime, datetime]:
@@ -157,6 +164,40 @@ async def fetch_rental_stats(
         handovers_today=ct,
         handovers_week=cw,
         handovers_month=cm,
+    )
+
+
+async def fetch_commission_stats(
+    session: AsyncSession, settings: Settings, *, viewer_user_id: int
+) -> CommissionStatsSnapshot:
+    _today_start, week_start, month_start = _utc_range_today_week_month(settings)
+    total = await session.scalar(
+        select(func.coalesce(func.sum(WeeklyInvoice.total_due), 0)).where(
+            WeeklyInvoice.status == "paid",
+            WeeklyInvoice.finalized_at.is_not(None),
+            WeeklyInvoice.owner_user_id != int(viewer_user_id),
+        )
+    )
+    week = await session.scalar(
+        select(func.coalesce(func.sum(WeeklyInvoice.total_due), 0)).where(
+            WeeklyInvoice.status == "paid",
+            WeeklyInvoice.finalized_at.is_not(None),
+            WeeklyInvoice.owner_user_id != int(viewer_user_id),
+            WeeklyInvoice.finalized_at >= week_start,
+        )
+    )
+    month = await session.scalar(
+        select(func.coalesce(func.sum(WeeklyInvoice.total_due), 0)).where(
+            WeeklyInvoice.status == "paid",
+            WeeklyInvoice.finalized_at.is_not(None),
+            WeeklyInvoice.owner_user_id != int(viewer_user_id),
+            WeeklyInvoice.finalized_at >= month_start,
+        )
+    )
+    return CommissionStatsSnapshot(
+        earned_total=Decimal(total or 0),
+        earned_week=Decimal(week or 0),
+        earned_month=Decimal(month or 0),
     )
 
 

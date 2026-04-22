@@ -65,7 +65,7 @@ from bot.services.rental import (
     rent_hours_bounds,
 )
 from bot.services.admin_notify import notify_superadmins_discipline_warning
-from bot.services.rental_stats import fetch_rental_stats, record_handover_stat
+from bot.services.rental_stats import fetch_commission_stats, fetch_rental_stats, record_handover_stat
 from bot.services.rental_logs import (
     AdminLogOwnerRow,
     admins_with_log_activity,
@@ -2349,7 +2349,7 @@ def _booking_sort_key_rental(rent: Rental) -> datetime:
 
 
 def _rent_stats_text(
-    snap, settings: Settings, *, title: str, include_scope_note: bool = True
+    snap, settings: Settings, *, title: str, include_scope_note: bool = True, commission_snap=None
 ) -> str:
     tz_hint = escape(settings.time_zone_label.strip() or "локальному времени бота")
     text = (
@@ -2369,6 +2369,13 @@ def _rent_stats_text(
             "по владельцу вещи на момент просмотра (общие вещи без владельца в персональную статистику "
             "не попадают). Учёт с момента появления функции; аренды после срока бот удаляет — "
             "в прошлое не восстанавливаются.</i>"
+        )
+    if commission_snap is not None:
+        text += (
+            "\n\n<b>Комиссии с других админов (подтверждённые оплаты)</b>\n"
+            f"За неделю: {format_money(commission_snap.earned_week)}\n"
+            f"За месяц: {format_money(commission_snap.earned_month)}\n"
+            f"За всё время: {format_money(commission_snap.earned_total)}"
         )
     return text
 
@@ -2721,11 +2728,14 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     uid = message.from_user.id
     async with db_session.async_session_maker() as session:
         snap = await fetch_rental_stats(session, settings, admin_user_id=uid)
+        com_snap = None
+        if is_superadmin(uid, settings):
+            com_snap = await fetch_commission_stats(session, settings, viewer_user_id=uid)
         r_items = await session.execute(select(Item).order_by(Item.id.asc()))
         all_items = list(r_items.scalars().unique())
         managed_items = [x for x in all_items if admin_manages_item(uid, x)]
         await session.commit()
-    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды")
+    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды", commission_snap=com_snap)
     kb = _rent_stats_item_keyboard(managed_items) if managed_items else None
     if managed_items:
         text += "\n\nВыберите аксессуар, чтобы посмотреть статистику по нему:"
@@ -2852,11 +2862,14 @@ async def admin_rent_stats_all(query: CallbackQuery, settings: Settings) -> None
     uid = query.from_user.id
     async with db_session.async_session_maker() as session:
         snap = await fetch_rental_stats(session, settings, admin_user_id=uid)
+        com_snap = None
+        if is_superadmin(uid, settings):
+            com_snap = await fetch_commission_stats(session, settings, viewer_user_id=uid)
         r_items = await session.execute(select(Item).order_by(Item.id.asc()))
         all_items = list(r_items.scalars().unique())
         managed_items = [x for x in all_items if admin_manages_item(uid, x)]
         await session.commit()
-    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды")
+    text = _rent_stats_text(snap, settings, title="Ваша статистика аренды", commission_snap=com_snap)
     if managed_items:
         text += "\n\nВыберите аксессуар, чтобы посмотреть статистику по нему:"
     await query.message.edit_text(

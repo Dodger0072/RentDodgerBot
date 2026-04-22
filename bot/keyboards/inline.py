@@ -67,6 +67,7 @@ def category_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Платная аренда", callback_data="cat:paid"),
         InlineKeyboardButton(text="Бесплатная аренда", callback_data="cat:free"),
     )
+    b.row(InlineKeyboardButton(text="Сдавать свои вещи", callback_data="u:be_owner_info"))
     return b.as_markup()
 
 
@@ -76,6 +77,7 @@ def category_keyboard_for_admin(*, is_admin_user: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Платная аренда", callback_data="cat:paid"),
         InlineKeyboardButton(text="Бесплатная аренда", callback_data="cat:free"),
     )
+    b.row(InlineKeyboardButton(text="Сдавать свои вещи", callback_data="u:be_owner_info"))
     if is_admin_user:
         b.row(InlineKeyboardButton(text="Админ-панель", callback_data="adm:panel"))
     return b.as_markup()
