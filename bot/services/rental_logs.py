@@ -46,13 +46,32 @@ class AdminLogItemRow:
     events_count: int
 
 
-async def admins_with_log_activity(session: AsyncSession) -> list[int]:
+@dataclass(frozen=True)
+class AdminLogOwnerRow:
+    user_id: int
+    username: str
+
+
+async def admins_with_log_activity(session: AsyncSession) -> list[AdminLogOwnerRow]:
     q = await session.execute(
-        select(RentalDecisionLog.owner_user_id)
+        select(
+            RentalDecisionLog.owner_user_id,
+            func.coalesce(func.max(Item.owner_username), ""),
+        )
+        .select_from(RentalDecisionLog)
+        .outerjoin(Item, Item.owner_user_id == RentalDecisionLog.owner_user_id)
         .group_by(RentalDecisionLog.owner_user_id)
         .order_by(RentalDecisionLog.owner_user_id.asc())
     )
-    return [int(x) for x in q.scalars().all()]
+    out: list[AdminLogOwnerRow] = []
+    for uid, uname in q.all():
+        out.append(
+            AdminLogOwnerRow(
+                user_id=int(uid),
+                username=str(uname or "").strip().lstrip("@"),
+            )
+        )
+    return out
 
 
 async def items_with_logs_for_admin(session: AsyncSession, admin_user_id: int) -> list[AdminLogItemRow]:

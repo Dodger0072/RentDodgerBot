@@ -66,6 +66,7 @@ from bot.services.rental import (
 from bot.services.admin_notify import notify_superadmins_discipline_warning
 from bot.services.rental_stats import fetch_rental_stats, record_handover_stat
 from bot.services.rental_logs import (
+    AdminLogOwnerRow,
     admins_with_log_activity,
     items_with_logs_for_admin,
     latest_logs_for_admin_item,
@@ -169,6 +170,20 @@ def _admin_panel_pick_item_keyboard(
     return b
 
 
+def _admin_delete_owner_picker_keyboard(rows: list[tuple[int, str]]) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    for uid, uname in rows:
+        label = f"@{escape(uname)}" if uname else "@без_username"
+        b.row(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"adm:panel:pick_delete_owner:{uid}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Назад в панель", callback_data="adm:panel"))
+    return b
+
+
 async def _show_admin_item_picker(
     target: Message, *, mode: str, uid: int, settings: Settings
 ) -> None:
@@ -190,6 +205,23 @@ async def _show_admin_item_picker(
         return
     kb = _admin_panel_pick_item_keyboard(items, mode="delete", uid=uid, settings=settings)
     await target.answer("Выберите вещь для удаления:", reply_markup=kb.as_markup())
+
+
+async def _show_superadmin_delete_owner_picker(target: Message) -> None:
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Item.owner_user_id, Item.owner_username)
+            .where(Item.owner_user_id.is_not(None))
+            .distinct()
+            .order_by(Item.owner_username.asc(), Item.owner_user_id.asc())
+        )
+        rows = [(int(uid), str(un or "").strip().lstrip("@")) for uid, un in r.all() if uid is not None]
+        await session.commit()
+    if not rows:
+        await target.answer("Нет админов с привязанными вещами.")
+        return
+    kb = _admin_delete_owner_picker_keyboard(rows)
+    await target.answer("Выберите админа, чьи вещи хотите удалить:", reply_markup=kb.as_markup())
 
 
 def _admin_panel_blackout_keyboard(
@@ -278,6 +310,9 @@ async def admin_panel_action(
         )
         return
     if action == "pick_delete":
+        if is_superadmin(query.from_user.id, settings):
+            await _show_superadmin_delete_owner_picker(query.message)
+            return
         await _show_admin_item_picker(
             query.message, mode="delete", uid=query.from_user.id, settings=settings
         )
@@ -313,6 +348,37 @@ async def admin_panel_action(
         "Неизвестный пункт панели. Откройте панель заново.",
         reply_markup=category_keyboard_for_admin(is_admin_user=True),
     )
+
+
+@router.callback_query(F.data.regexp(r"^adm:panel:pick_delete_owner:(\d+)$"))
+async def superadmin_pick_delete_owner_items(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    owner_user_id = int((query.data or "").split(":")[3])
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Item)
+            .where(Item.owner_user_id == owner_user_id)
+            .order_by(Item.display_order.asc(), Item.id.asc())
+        )
+        items = list(r.scalars().unique())
+        await session.commit()
+    if not items:
+        await query.answer("У этого админа нет вещей.", show_alert=True)
+        return
+    kb = _admin_panel_pick_item_keyboard(
+        items,
+        mode="delete",
+        uid=query.from_user.id,
+        settings=settings,
+    )
+    await query.message.edit_text(
+        f"Выберите вещь для удаления у @{escape(items[0].owner_username or 'без_username')}:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb.as_markup(),
+    )
+    await query.answer()
 
 
 @router.callback_query(F.data.regexp(r"^adm:panel:(edit|delete):(\d+)$"))
@@ -2307,12 +2373,15 @@ def _rent_stats_item_keyboard(items: list[Item], selected_item_id: int | None = 
     return kb.as_markup()
 
 
-def _item_logs_admin_keyboard(admin_ids: list[int]) -> InlineKeyboardBuilder:
+def _item_logs_admin_keyboard(admin_rows: list[AdminLogOwnerRow]) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
-    for uid in admin_ids:
+    for row in admin_rows:
+        uid = int(row.user_id)
+        uname = (row.username or "").strip().lstrip("@")
+        label = f"@{escape(uname)}" if uname else "@без_username"
         kb.row(
             InlineKeyboardButton(
-                text=f"Админ {uid}",
+                text=label,
                 callback_data=f"adm:ilog:admin:{uid}",
             )
         )
@@ -2361,12 +2430,12 @@ async def cmd_item_logs(message: Message, settings: Settings) -> None:
     if not is_superadmin(message.from_user.id, settings):
         return
     async with db_session.async_session_maker() as session:
-        admin_ids = await admins_with_log_activity(session)
+        admin_rows = await admins_with_log_activity(session)
         await session.commit()
-    if not admin_ids:
+    if not admin_rows:
         await message.answer("Логи пока пусты.")
         return
-    kb = _item_logs_admin_keyboard(admin_ids)
+    kb = _item_logs_admin_keyboard(admin_rows)
     await message.answer("Выберите администратора для просмотра логов:", reply_markup=kb.as_markup())
 
 
@@ -2376,14 +2445,14 @@ async def item_logs_pick_admin(query: CallbackQuery, settings: Settings) -> None
         await query.answer("Только суперадмин", show_alert=True)
         return
     async with db_session.async_session_maker() as session:
-        admin_ids = await admins_with_log_activity(session)
+        admin_rows = await admins_with_log_activity(session)
         await session.commit()
-    if not admin_ids:
+    if not admin_rows:
         await query.answer("Логи пусты", show_alert=True)
         return
     await query.message.edit_text(
         "Выберите администратора для просмотра логов:",
-        reply_markup=_item_logs_admin_keyboard(admin_ids).as_markup(),
+        reply_markup=_item_logs_admin_keyboard(admin_rows).as_markup(),
     )
     await query.answer()
 
@@ -2395,14 +2464,21 @@ async def item_logs_pick_item(query: CallbackQuery, settings: Settings) -> None:
         return
     admin_user_id = int((query.data or "").split(":")[3])
     async with db_session.async_session_maker() as session:
+        owner_rows = await admins_with_log_activity(session)
         rows = await items_with_logs_for_admin(session, admin_user_id)
         await session.commit()
     if not rows:
         await query.answer("По этому админу логов нет", show_alert=True)
         return
+    owner_username = ""
+    for row in owner_rows:
+        if int(row.user_id) == admin_user_id:
+            owner_username = (row.username or "").strip().lstrip("@")
+            break
+    owner_tag = f"@{escape(owner_username)}" if owner_username else "@без_username"
     kb = _item_logs_items_keyboard(admin_user_id, rows)
     await query.message.edit_text(
-        f"Админ <code>{admin_user_id}</code>. Выберите вещь:",
+        f"Админ {owner_tag}. Выберите вещь:",
         parse_mode=ParseMode.HTML,
         reply_markup=kb.as_markup(),
     )
@@ -2419,6 +2495,7 @@ async def item_logs_show(query: CallbackQuery, settings: Settings) -> None:
     raw_item_id = int(parts[4])
     item_id = None if raw_item_id == 0 else raw_item_id
     async with db_session.async_session_maker() as session:
+        owner_rows = await admins_with_log_activity(session)
         events = await latest_logs_for_admin_item(
             session, admin_user_id=admin_user_id, item_id=item_id, limit=60
         )
@@ -2426,7 +2503,13 @@ async def item_logs_show(query: CallbackQuery, settings: Settings) -> None:
     if not events:
         await query.answer("События не найдены", show_alert=True)
         return
-    title = f"Логи по админу <code>{admin_user_id}</code>, вещь <code>{raw_item_id}</code>"
+    owner_username = ""
+    for row in owner_rows:
+        if int(row.user_id) == admin_user_id:
+            owner_username = (row.username or "").strip().lstrip("@")
+            break
+    owner_tag = f"@{escape(owner_username)}" if owner_username else "@без_username"
+    title = f"Логи по админу {owner_tag}, вещь <code>{raw_item_id}</code>"
     lines = [_log_event_line(ev, settings) for ev in events]
     text = f"<b>Журнал действий</b>\n{title}\n\n" + "\n".join(lines)
     if len(text) > 4000:
