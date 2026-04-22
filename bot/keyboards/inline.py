@@ -89,6 +89,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="Удалить вещь", callback_data="adm:panel:pick_delete"))
     b.row(InlineKeyboardButton(text="Брони и аренды", callback_data="adm:panel:bookings"))
     b.row(InlineKeyboardButton(text="Статистика", callback_data="adm:panel:rent_stats"))
+    b.row(InlineKeyboardButton(text="Мои неоплаченные счета", callback_data="adm:panel:my_invoices"))
     b.row(InlineKeyboardButton(text="Добавить окно неактива", callback_data="adm:panel:add_blackout"))
     b.row(InlineKeyboardButton(text="Список окон неактива", callback_data="adm:panel:list_blackouts"))
     b.row(InlineKeyboardButton(text="Удалить окно неактива", callback_data="adm:panel:pick_delete_blackout"))

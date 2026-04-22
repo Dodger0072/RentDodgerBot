@@ -43,6 +43,7 @@ def _admin_commands() -> list[BotCommand]:
         BotCommand(command="bookings", description="Брони и аренды (админ)"),
         BotCommand(command="drop_request", description="Снять зависшую заявку по вещи"),
         BotCommand(command="rent_stats", description="Статистика выдач и дохода"),
+        BotCommand(command="my_invoices", description="Мои неоплаченные счета"),
         BotCommand(command="add_item", description="Добавить вещь"),
         BotCommand(command="list_items", description="Список ваших вещей"),
         BotCommand(command="edit_item", description="Редактировать вещь по id"),

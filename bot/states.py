@@ -57,3 +57,7 @@ class AdminReservationStates(StatesGroup):
 class AdminBlackoutStates(StatesGroup):
     waiting_start = State()
     waiting_end = State()
+
+
+class AdminInvoiceStates(StatesGroup):
+    waiting_screenshot = State()

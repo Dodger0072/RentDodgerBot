@@ -30,6 +30,7 @@ from bot.db.models import (
     RentalState,
     Reservation,
     UserBan,
+    WeeklyInvoice,
     WeeklyInvoiceItem,
 )
 from bot.db import session as db_session
@@ -99,11 +100,12 @@ from bot.time_format import format_local_time
 from bot.states import (
     AddItemStates,
     AdminBlackoutStates,
+    AdminInvoiceStates,
     AdminRentalStates,
     AdminReservationStates,
     EditItemStates,
 )
-from sqlalchemy import or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -325,6 +327,10 @@ async def admin_panel_action(
         msg.text = "/rent_stats"
         await cmd_rent_stats(msg, settings)
         return
+    if action == "my_invoices":
+        msg.text = "/my_invoices"
+        await cmd_my_invoices(msg, state, settings)
+        return
     if action == "add_blackout":
         msg.text = "/add_blackout"
         await cmd_add_blackout(msg, state, settings)
@@ -429,6 +435,7 @@ async def admin_panel_item_action(
                 await query.message.answer("Удалить может только владелец вещи или суперадмин.")
             return
         name = item.name
+        await _force_cleanup_item_dependencies(session, item.id)
         await session.delete(item)
         await session.commit()
     await state.clear()
@@ -526,6 +533,30 @@ def _edit_item_header_html(item: Item) -> str:
         f"{cat} · {ic} · срок {lo}–{hi} ч{prices}\n\n"
         f"Что изменить?"
     )
+
+
+async def _force_cleanup_item_dependencies(session: AsyncSession, item_id: int) -> None:
+    """Удаляем зависимые записи, чтобы вещь можно было удалить даже при активных арендах/бронях."""
+    iid = int(item_id)
+    await session.execute(delete(Rental).where(Rental.item_id == iid))
+    await session.execute(delete(Reservation).where(Reservation.item_id == iid))
+    await session.execute(delete(ItemBlackout).where(ItemBlackout.item_id == iid))
+
+    r_links = await session.execute(
+        select(BlackoutWindowItem.window_id).where(BlackoutWindowItem.item_id == iid)
+    )
+    window_ids = {int(x) for x in r_links.scalars().all()}
+    await session.execute(delete(BlackoutWindowItem).where(BlackoutWindowItem.item_id == iid))
+    for wid in window_ids:
+        left = await session.scalar(
+            select(func.count())
+            .select_from(BlackoutWindowItem)
+            .where(BlackoutWindowItem.window_id == wid)
+        )
+        if int(left or 0) == 0:
+            w = await session.get(AdminBlackoutWindow, wid)
+            if w is not None:
+                await session.delete(w)
 
 
 def _landlord_tag_html(owner_user_id: int | None, owner_username: str | None) -> str:
@@ -1621,24 +1652,10 @@ async def cmd_delete_item(message: Message, settings: Settings) -> None:
                     "Удалить может только владелец вещи или суперадмин."
                 )
             return
-        try:
-            await session.delete(item)
-            await session.commit()
-            await message.answer(f"Вещь {iid} удалена.")
-            return
-        except IntegrityError:
-            await session.rollback()
-            r2 = await session.execute(select(Item).where(Item.id == iid))
-            existing = r2.scalar_one_or_none()
-            if existing is None:
-                await message.answer("Вещь уже удалена.")
-                return
-            existing.is_visible = False
-            await session.commit()
-    await message.answer(
-        "Вещь не удалена физически из-за истории, но скрыта из каталога пользователей. "
-        "В истории и статистике запись сохранена."
-    )
+        await _force_cleanup_item_dependencies(session, item.id)
+        await session.delete(item)
+        await session.commit()
+        await message.answer(f"Вещь {iid} удалена.")
 
 
 @router.message(Command("item_order"))
@@ -2403,6 +2420,37 @@ def _item_logs_items_keyboard(admin_user_id: int, rows) -> InlineKeyboardBuilder
     return kb
 
 
+def _invoice_status_label(status: str) -> str:
+    if status == "awaiting_payment":
+        return "ждет оплату"
+    if status == "pending_review":
+        return "на проверке"
+    if status == "rework_required":
+        return "нужна доработка"
+    if status == "paid":
+        return "оплачен"
+    return status
+
+
+def _my_invoices_keyboard(rows: list[WeeklyInvoice], settings: Settings) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for inv in rows:
+        period = (
+            f"{format_local_time(inv.week_start_at, settings)} - "
+            f"{format_local_time(inv.week_end_at, settings)}"
+        )
+        due = format_money(Decimal(inv.total_due))
+        st = _invoice_status_label(inv.status)
+        kb.row(
+            InlineKeyboardButton(
+                text=f"#{inv.id} {period} | {due} | {st}",
+                callback_data=f"adm:invsel:{inv.id}",
+            )
+        )
+    kb.row(InlineKeyboardButton(text="« Назад в панель", callback_data="adm:panel"))
+    return kb
+
+
 def _log_event_line(ev, settings: Settings) -> str:
     when = format_local_time(ev.created_at, settings)
     uname = escape((ev.renter_username or "—").lstrip("@"))
@@ -2684,6 +2732,66 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+@router.message(Command("my_invoices"))
+async def cmd_my_invoices(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    uid = message.from_user.id
+    async with db_session.async_session_maker() as session:
+        q = await session.execute(
+            select(WeeklyInvoice)
+            .where(
+                WeeklyInvoice.owner_user_id == int(uid),
+                WeeklyInvoice.status.in_(["awaiting_payment", "rework_required", "pending_review"]),
+            )
+            .order_by(WeeklyInvoice.week_end_at.desc())
+        )
+        rows = list(q.scalars().unique())
+        await session.commit()
+    await state.clear()
+    if not rows:
+        await message.answer("У вас нет неоплаченных счетов.")
+        return
+    await message.answer(
+        "Выберите счёт по неделе:",
+        reply_markup=_my_invoices_keyboard(rows, settings).as_markup(),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^adm:invsel:(\d+)$"))
+async def admin_select_invoice_for_payment(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    invoice_id = int((query.data or "").split(":")[2])
+    uid = query.from_user.id
+    async with db_session.async_session_maker() as session:
+        q = await session.execute(
+            select(WeeklyInvoice)
+            .where(WeeklyInvoice.id == invoice_id, WeeklyInvoice.owner_user_id == int(uid))
+        )
+        inv = q.scalar_one_or_none()
+        await session.commit()
+    if inv is None:
+        await query.answer("Счёт не найден", show_alert=True)
+        return
+    if inv.status == "paid":
+        await query.answer("Этот счёт уже оплачен", show_alert=True)
+        return
+    if inv.status == "pending_review":
+        await query.answer("Скрин уже отправлен и ждёт проверку", show_alert=True)
+        return
+    await state.set_state(AdminInvoiceStates.waiting_screenshot)
+    await state.update_data(invoice_payment_id=inv.id)
+    await query.message.answer(
+        "Отправьте скрин перевода одним фото в этот чат.\n"
+        "Можно добавить комментарий в подписи.",
+    )
+    await query.answer()
+
+
 @router.message(Command("issue_invoice_now"))
 async def cmd_issue_invoice_now(message: Message, settings: Settings) -> None:
     if not is_superadmin(message.from_user.id, settings):
@@ -2828,6 +2936,45 @@ async def admin_collect_payment_screenshot(message: Message, settings: Settings)
         await notify_superadmins_about_proof(message.bot, settings, invoice, proof, item_rows)
         await session.commit()
     await message.answer("Скрин оплаты принят и отправлен суперадмину на проверку.")
+
+
+@router.message(AdminInvoiceStates.waiting_screenshot, F.photo)
+async def admin_collect_payment_screenshot_selected(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    data = await state.get_data()
+    invoice_id = data.get("invoice_payment_id")
+    if invoice_id is None:
+        await state.clear()
+        await message.answer("Сессия оплаты сброшена. Выберите счёт заново в /my_invoices.")
+        return
+    file_id = message.photo[-1].file_id
+    note = (message.caption or "").strip()
+    async with db_session.async_session_maker() as session:
+        invoice, proof, err = await register_payment_proof(
+            session,
+            owner_user_id=message.from_user.id,
+            screenshot_file_id=file_id,
+            note=note,
+            invoice_id=int(invoice_id),
+        )
+        if err is not None:
+            await session.rollback()
+            await message.answer(err)
+            return
+        q_items = await session.execute(
+            select(WeeklyInvoiceItem)
+            .where(WeeklyInvoiceItem.invoice_id == invoice.id)
+            .order_by(WeeklyInvoiceItem.id.asc())
+        )
+        item_rows = list(q_items.scalars().unique())
+        await notify_superadmins_about_proof(message.bot, settings, invoice, proof, item_rows)
+        await session.commit()
+    await state.clear()
+    await message.answer("Скрин по выбранному счёту отправлен суперадмину на проверку.")
 
 
 @router.callback_query(F.data.regexp(r"^adm:inv:(approve|reject|rework):(\d+)$"))

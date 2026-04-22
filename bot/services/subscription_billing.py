@@ -260,18 +260,30 @@ async def register_payment_proof(
     owner_user_id: int,
     screenshot_file_id: str,
     note: str = "",
+    invoice_id: int | None = None,
 ) -> tuple[WeeklyInvoice | None, PaymentProof | None, str | None]:
-    q = await session.execute(
-        select(WeeklyInvoice)
-        .where(
-            WeeklyInvoice.owner_user_id == int(owner_user_id),
-            WeeklyInvoice.status.in_(["awaiting_payment", "rework_required"]),
+    if invoice_id is None:
+        q = await session.execute(
+            select(WeeklyInvoice)
+            .where(
+                WeeklyInvoice.owner_user_id == int(owner_user_id),
+                WeeklyInvoice.status.in_(["awaiting_payment", "rework_required"]),
+            )
+            .order_by(WeeklyInvoice.week_end_at.desc())
         )
-        .order_by(WeeklyInvoice.week_end_at.desc())
-    )
-    invoice = q.scalar_one_or_none()
+        invoice = q.scalar_one_or_none()
+    else:
+        q = await session.execute(
+            select(WeeklyInvoice).where(
+                WeeklyInvoice.id == int(invoice_id),
+                WeeklyInvoice.owner_user_id == int(owner_user_id),
+            )
+        )
+        invoice = q.scalar_one_or_none()
     if invoice is None:
         return None, None, "Нет открытого недельного долга для оплаты."
+    if invoice.status == "paid":
+        return None, None, "Этот счёт уже закрыт."
     q_proof = await session.execute(
         select(PaymentProof).where(
             PaymentProof.invoice_id == invoice.id,
