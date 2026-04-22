@@ -153,6 +153,15 @@ def _fmt_daily_minute(minute: int) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def _blackout_mode_keyboard() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="Разовое", callback_data="adm:blackout_mode:single"),
+        InlineKeyboardButton(text="Ежедневное", callback_data="adm:blackout_mode:daily"),
+    )
+    return b
+
+
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
     # Суперадмин должен иметь доступ ко всем админским командам,
     # даже если не продублирован в ADMIN_USER_IDS/ADMIN_USERNAMES.
@@ -2111,9 +2120,32 @@ async def cmd_add_blackout(message: Message, state: FSMContext, settings: Settin
         "Выберите режим:\n"
         "• <b>разовое</b> — один интервал по дате/времени;\n"
         "• <b>ежедневное</b> — повторяется каждый день по часам (например, 22:00-08:00).\n\n"
-        "Ответьте одним словом: <code>разовое</code> или <code>ежедневное</code>.",
+        "Нажмите кнопку ниже или ответьте текстом: <code>разовое</code> / <code>ежедневное</code>.",
+        reply_markup=_blackout_mode_keyboard().as_markup(),
         parse_mode=ParseMode.HTML,
     )
+
+
+@router.callback_query(
+    StateFilter(AdminBlackoutStates.waiting_mode),
+    F.data.regexp(r"^adm:blackout_mode:(single|daily)$"),
+)
+async def blackout_mode_pick(query: CallbackQuery, state: FSMContext) -> None:
+    mode = (query.data or "").split(":")[2]
+    if mode == "single":
+        await state.update_data(blackout_mode="single")
+        await state.set_state(AdminBlackoutStates.waiting_start)
+        await query.message.answer("Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode=ParseMode.HTML)
+        await _safe_query_answer(query)
+        return
+    await state.update_data(blackout_mode="daily")
+    await state.set_state(AdminBlackoutStates.waiting_start)
+    await query.message.answer(
+        "Введите <b>начало</b> ежедневного окна в формате <code>ЧЧ:ММ</code>.\n"
+        "Пример: <code>22:00</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    await _safe_query_answer(query)
 
 
 @router.message(AdminBlackoutStates.waiting_mode, F.text)
