@@ -85,6 +85,9 @@ class AdminBlackoutWindow(Base):
     owner_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_recurring_daily: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    recurring_start_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recurring_end_minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     window_items: Mapped[List["BlackoutWindowItem"]] = relationship(

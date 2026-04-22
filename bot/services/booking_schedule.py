@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +17,8 @@ from bot.time_format import format_local_time
 # Интервалы занятости: [start, end) — правая граница не входит (можно стыковать 15:00 ↔15:00).
 
 MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START = 1
+_RECURRING_DEFAULT_PAST_DAYS = 1
+_RECURRING_DEFAULT_FUTURE_DAYS = 45
 
 
 def user_may_cancel_reservation(*, now_utc: datetime, reservation_start_utc: datetime) -> bool:
@@ -84,22 +88,142 @@ def _append_blackout_interval(
         out[item_id].append((s, e))
 
 
+def _display_tz() -> ZoneInfo:
+    from os import getenv
+
+    tz_name = (getenv("DISPLAY_TZ", "Europe/Moscow") or "Europe/Moscow").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _valid_recurring_bounds(start_minute: int | None, end_minute: int | None) -> bool:
+    if start_minute is None or end_minute is None:
+        return False
+    if start_minute == end_minute:
+        return False
+    return 0 <= start_minute < 24 * 60 and 0 <= end_minute < 24 * 60
+
+
+def _recurring_interval_covering_point_utc(
+    t: datetime, start_minute: int, end_minute: int
+) -> tuple[datetime, datetime] | None:
+    tu = ensure_utc(t)
+    if tu is None or not _valid_recurring_bounds(start_minute, end_minute):
+        return None
+    tz = _display_tz()
+    local_t = tu.astimezone(tz)
+    minute = local_t.hour * 60 + local_t.minute
+    day = local_t.date()
+    if start_minute < end_minute:
+        if not (start_minute <= minute < end_minute):
+            return None
+        start_day = day
+        end_day = day
+    else:
+        if minute >= start_minute:
+            start_day = day
+            end_day = day + timedelta(days=1)
+        elif minute < end_minute:
+            start_day = day - timedelta(days=1)
+            end_day = day
+        else:
+            return None
+    s_local = datetime(
+        start_day.year,
+        start_day.month,
+        start_day.day,
+        start_minute // 60,
+        start_minute % 60,
+        tzinfo=tz,
+    )
+    e_local = datetime(
+        end_day.year,
+        end_day.month,
+        end_day.day,
+        end_minute // 60,
+        end_minute % 60,
+        tzinfo=tz,
+    )
+    return s_local.astimezone(UTC), e_local.astimezone(UTC)
+
+
+def _expand_recurring_daily_intervals_utc(
+    range_start: datetime,
+    range_end: datetime,
+    start_minute: int,
+    end_minute: int,
+) -> list[tuple[datetime, datetime]]:
+    rs, re = ensure_utc(range_start), ensure_utc(range_end)
+    if rs is None or re is None or re <= rs:
+        return []
+    if not _valid_recurring_bounds(start_minute, end_minute):
+        return []
+    tz = _display_tz()
+    local_start = rs.astimezone(tz)
+    local_end = re.astimezone(tz)
+    day: date = local_start.date() - timedelta(days=1)
+    last_day: date = local_end.date() + timedelta(days=1)
+    out: list[tuple[datetime, datetime]] = []
+    while day <= last_day:
+        s_local = datetime(
+            day.year, day.month, day.day, start_minute // 60, start_minute % 60, tzinfo=tz
+        )
+        if start_minute < end_minute:
+            e_day = day
+        else:
+            e_day = day + timedelta(days=1)
+        e_local = datetime(
+            e_day.year,
+            e_day.month,
+            e_day.day,
+            end_minute // 60,
+            end_minute % 60,
+            tzinfo=tz,
+        )
+        su = s_local.astimezone(UTC)
+        eu = e_local.astimezone(UTC)
+        if su < re and eu > rs:
+            out.append((max(su, rs), min(eu, re)))
+        day += timedelta(days=1)
+    return out
+
+
 async def load_blackout_intervals_for_item_ids(
-    session: AsyncSession, item_ids: list[int]
+    session: AsyncSession,
+    item_ids: list[int],
+    *,
+    range_start: datetime | None = None,
+    range_end: datetime | None = None,
 ) -> dict[int, list[tuple[datetime, datetime]]]:
     """Интервалы blackout: общие окна (/add_blackout) через blackout_window_items + legacy по одной вещи."""
     out: dict[int, list[tuple[datetime, datetime]]] = defaultdict(list)
     if not item_ids:
         return {}
     ids = list({int(x) for x in item_ids})
+    rs = ensure_utc(range_start) or (datetime.now(UTC) - timedelta(days=_RECURRING_DEFAULT_PAST_DAYS))
+    re = ensure_utc(range_end) or (datetime.now(UTC) + timedelta(days=_RECURRING_DEFAULT_FUTURE_DAYS))
     r_w = await session.execute(
-        select(BlackoutWindowItem.item_id, AdminBlackoutWindow.start_at, AdminBlackoutWindow.end_at)
+        select(
+            BlackoutWindowItem.item_id,
+            AdminBlackoutWindow.start_at,
+            AdminBlackoutWindow.end_at,
+            AdminBlackoutWindow.is_recurring_daily,
+            AdminBlackoutWindow.recurring_start_minute,
+            AdminBlackoutWindow.recurring_end_minute,
+        )
         .select_from(BlackoutWindowItem)
         .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
         .where(BlackoutWindowItem.item_id.in_(ids))
     )
-    for iid, sa, ea in r_w.all():
-        _append_blackout_interval(out, int(iid), sa, ea)
+    for iid, sa, ea, is_rec, rec_s, rec_e in r_w.all():
+        key = int(iid)
+        if bool(is_rec):
+            for s, e in _expand_recurring_daily_intervals_utc(rs, re, rec_s, rec_e):
+                out[key].append((s, e))
+        else:
+            _append_blackout_interval(out, key, sa, ea)
     r_leg = await session.execute(
         select(ItemBlackout.item_id, ItemBlackout.start_at, ItemBlackout.end_at).where(
             ItemBlackout.item_id.in_(ids),
@@ -111,10 +235,54 @@ async def load_blackout_intervals_for_item_ids(
     return dict(out)
 
 
-async def load_blackout_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
-    m = await load_blackout_intervals_for_item_ids(session, [item_id])
+async def load_blackout_intervals_utc(
+    session: AsyncSession,
+    item_id: int,
+    *,
+    range_start: datetime | None = None,
+    range_end: datetime | None = None,
+) -> list[tuple[datetime, datetime]]:
+    m = await load_blackout_intervals_for_item_ids(
+        session, [item_id], range_start=range_start, range_end=range_end
+    )
     iv = m.get(item_id, [])
     return sorted(iv, key=lambda t: t[0])
+
+
+async def blackout_max_end_covering_point_db(
+    session: AsyncSession, item_id: int, t: datetime
+) -> datetime | None:
+    tu = ensure_utc(t)
+    if tu is None:
+        return None
+    iv = await load_blackout_intervals_for_item_ids(
+        session,
+        [item_id],
+        range_start=tu - timedelta(days=1),
+        range_end=tu + timedelta(days=2),
+    )
+    best = blackout_max_end_covering_point(tu, iv.get(item_id, []))
+    if best is not None:
+        return best
+    r_daily = await session.execute(
+        select(
+            AdminBlackoutWindow.recurring_start_minute,
+            AdminBlackoutWindow.recurring_end_minute,
+        )
+        .select_from(BlackoutWindowItem)
+        .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
+        .where(
+            BlackoutWindowItem.item_id == item_id,
+            AdminBlackoutWindow.is_recurring_daily.is_(True),
+        )
+    )
+    ends: list[datetime] = []
+    for smin, emin in r_daily.all():
+        iv2 = _recurring_interval_covering_point_utc(tu, smin, emin)
+        if iv2 is None:
+            continue
+        ends.append(iv2[1])
+    return max(ends) if ends else None
 
 
 async def load_busy_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
@@ -168,8 +336,7 @@ async def explain_booking_start_conflict(
         return (
             "Это время уже занято другой бронью или текущей арендой. Укажите другое начало."
         )
-    bo = await load_blackout_intervals_utc(session, item_id)
-    until = blackout_max_end_covering_point(su, bo)
+    until = await blackout_max_end_covering_point_db(session, item_id, su)
     if until is not None:
         return user_msg_blocked_by_blackout_until(settings, until) + " Укажите другое начало."
     rr = await load_rr_busy_intervals_utc(session, item_id)
@@ -357,11 +524,18 @@ async def format_user_booking_availability_block(
     """HTML: краткий список окон, где можно указать начало брони."""
     now_u = ensure_utc(now) or datetime.now(UTC)
     lo, hi = rent_lo_hi(item)
+    horizon = now_u + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
     rr = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
-    bo = merge_intervals_utc(await load_blackout_intervals_utc(session, item_id))
+    bo = merge_intervals_utc(
+        await load_blackout_intervals_utc(
+            session,
+            item_id,
+            range_start=now_u - timedelta(days=1),
+            range_end=horizon,
+        )
+    )
     cursor = now_u
     lines: list[str] = []
-    horizon = cursor + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
 
     def _right_edge_is_rr_start(se: datetime) -> bool:
         se_u = ensure_utc(se)
@@ -471,16 +645,10 @@ async def validate_new_reservation(
         return "Есть ожидающая заявка у администратора — бронь временно недоступна."
 
     busy_rr = await load_rr_busy_intervals_utc(session, item_id)
-    bo = await load_blackout_intervals_utc(session, item_id)
+    until = await blackout_max_end_covering_point_db(session, item_id, s)
     # Blackout: нельзя начать выдачу в этот момент; пересечение [s,e) с blackout допустимо.
-    if point_inside_busy(s, bo):
-        until = blackout_max_end_covering_point(s, bo)
-        if until is not None:
-            return user_msg_blocked_by_blackout_until(settings, until) + " Укажите другое время начала."
-        return (
-            "В это время владелец не сможет выдать вещь (окно недоступности). "
-            "Укажите другое время начала."
-        )
+    if until is not None:
+        return user_msg_blocked_by_blackout_until(settings, until) + " Укажите другое время начала."
     if point_inside_busy(s, busy_rr):
         return (
             "Это время уже занято другой бронью или текущей арендой. Укажите другое время начала."

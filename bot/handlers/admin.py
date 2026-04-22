@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -46,7 +47,9 @@ from bot.keyboards.inline import (
 from bot.item_categories import ITEM_CATEGORY_SLUGS, UNCATEGORIZED_SLUG, item_category_label
 from bot.services.booking_schedule import parse_booking_start_text
 from bot.services.item_blackout import (
+    cancel_pending_rentals_hit_by_daily_blackout,
     cancel_pending_rentals_hit_by_blackout,
+    cancel_reservations_hit_by_daily_blackout,
     cancel_reservations_hit_by_blackout,
 )
 from bot.services.item_order import next_display_order_for_group, reorder_item_to_position
@@ -132,6 +135,22 @@ class _PanelMessageProxy:
 def _omit_fsm_keys(d: dict, *keys: str) -> dict:
     drop = set(keys)
     return {k: v for k, v in d.items() if k not in drop}
+
+
+def _parse_daily_time_to_minute(text: str) -> int | None:
+    m = re.match(r"^\s*(\d{1,2})\D+(\d{1,2})\s*$", text or "")
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return hh * 60 + mm
+
+
+def _fmt_daily_minute(minute: int) -> str:
+    h = minute // 60
+    m = minute % 60
+    return f"{h:02d}:{m:02d}"
 
 
 def _admin_only(settings: Settings, user_id: int, username: str | None) -> bool:
@@ -226,14 +245,12 @@ async def _show_superadmin_delete_owner_picker(target: Message) -> None:
     await target.answer("Выберите админа, чьи вещи хотите удалить:", reply_markup=kb.as_markup())
 
 
-def _admin_panel_blackout_keyboard(
-    rows: list[tuple[int, datetime, datetime, str]], settings: Settings
-) -> InlineKeyboardBuilder:
+def _admin_panel_blackout_keyboard(rows: list[tuple[int, str]]) -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
-    for bid, start_at, end_at, title in rows:
+    for bid, label in rows:
         b.row(
             InlineKeyboardButton(
-                text=f"#{bid} {title}: {format_local_time(start_at, settings)} - {format_local_time(end_at, settings)}",
+                text=f"#{bid} {label}",
                 callback_data=f"adm:panel:delblackout:{bid}",
             )
         )
@@ -243,17 +260,31 @@ def _admin_panel_blackout_keyboard(
 
 async def _show_admin_blackout_picker(target: Message, *, uid: int, settings: Settings) -> None:
     now = datetime.now(UTC)
-    rows: list[tuple[int, datetime, datetime, str]] = []
+    rows: list[tuple[int, str]] = []
     async with db_session.async_session_maker() as session:
         r_w = await session.execute(
             select(AdminBlackoutWindow).where(
                 AdminBlackoutWindow.owner_user_id == uid,
-                AdminBlackoutWindow.end_at > now,
+                or_(
+                    AdminBlackoutWindow.is_recurring_daily.is_(True),
+                    AdminBlackoutWindow.end_at > now,
+                ),
             )
         )
         windows = list(r_w.scalars().unique())
         for w in windows:
-            rows.append((w.id, w.start_at, w.end_at, "общее окно"))
+            if w.is_recurring_daily and w.recurring_start_minute is not None and w.recurring_end_minute is not None:
+                label = (
+                    "ежедневное окно: "
+                    f"{_fmt_daily_minute(int(w.recurring_start_minute))} - "
+                    f"{_fmt_daily_minute(int(w.recurring_end_minute))}"
+                )
+            else:
+                label = (
+                    "общее окно: "
+                    f"{format_local_time(w.start_at, settings)} - {format_local_time(w.end_at, settings)}"
+                )
+            rows.append((w.id, label))
 
         r_b = await session.execute(
             select(ItemBlackout)
@@ -269,12 +300,18 @@ async def _show_admin_blackout_picker(target: Message, *, uid: int, settings: Se
         if not admin_manages_item(uid, bo.item):
             continue
         name = escape(bo.item.name if bo.item else "?")
-        rows.append((bo.id, bo.start_at, bo.end_at, f"одна вещь ({name})"))
-    rows.sort(key=lambda x: x[1])
+        rows.append(
+            (
+                bo.id,
+                f"одна вещь ({name}): "
+                f"{format_local_time(bo.start_at, settings)} - {format_local_time(bo.end_at, settings)}",
+            )
+        )
+    rows.sort(key=lambda x: x[0])
     if not rows:
         await target.answer("Нет окон неактива для удаления.")
         return
-    kb = _admin_panel_blackout_keyboard(rows, settings)
+    kb = _admin_panel_blackout_keyboard(rows)
     await target.answer("Выберите окно неактива для удаления:", reply_markup=kb.as_markup())
 
 
@@ -2068,13 +2105,45 @@ async def cmd_list_warnings(message: Message, settings: Settings) -> None:
 async def cmd_add_blackout(message: Message, state: FSMContext, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
-    await state.set_state(AdminBlackoutStates.waiting_start)
+    await state.set_state(AdminBlackoutStates.waiting_mode)
     await message.answer(
         "Окно неактива для <b>всех ваших управляемых вещей</b>.\n\n"
-        "Будут сняты <b>брони</b> и <b>ожидающие выдачи заявки</b>, у которых "
-        "<b>начало слота</b> попадает в это окно (если начало раньше окна, а дальше слот только пересекается — "
-        "бронь остаётся).\n\n"
-        "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+        "Выберите режим:\n"
+        "• <b>разовое</b> — один интервал по дате/времени;\n"
+        "• <b>ежедневное</b> — повторяется каждый день по часам (например, 22:00-08:00).\n\n"
+        "Ответьте одним словом: <code>разовое</code> или <code>ежедневное</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(AdminBlackoutStates.waiting_mode, F.text)
+async def blackout_mode(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        await state.clear()
+        return
+    raw = (message.text or "").strip().lower()
+    if raw in ("разовое", "одноразовое", "single", "once"):
+        await state.update_data(blackout_mode="single")
+        await state.set_state(AdminBlackoutStates.waiting_start)
+        await message.answer(
+            "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if raw in ("ежедневное", "регулярное", "daily", "regular"):
+        await state.update_data(blackout_mode="daily")
+        await state.set_state(AdminBlackoutStates.waiting_start)
+        await message.answer(
+            "Введите <b>начало</b> ежедневного окна в формате <code>ЧЧ:ММ</code>.\n"
+            "Пример: <code>22:00</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await message.answer(
+        "Не понял режим. Напишите <code>разовое</code> или <code>ежедневное</code>.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2086,6 +2155,24 @@ async def blackout_start(message: Message, state: FSMContext, settings: Settings
         return
     if (message.text or "").strip().startswith("/"):
         await state.clear()
+        return
+    data = await state.get_data()
+    mode = str(data.get("blackout_mode") or "single")
+    if mode == "daily":
+        start_minute = _parse_daily_time_to_minute(message.text or "")
+        if start_minute is None:
+            await message.answer(
+                "Не разобрал время. Пример: <code>22:00</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await state.update_data(blackout_daily_start_minute=start_minute)
+        await state.set_state(AdminBlackoutStates.waiting_end)
+        await message.answer(
+            "Введите <b>конец</b> ежедневного окна в формате <code>ЧЧ:ММ</code>.\n"
+            "Можно через полночь, например: <code>08:00</code> для окна 22:00-08:00.",
+            parse_mode=ParseMode.HTML,
+        )
         return
     parsed = parse_booking_start_text(message.text or "", settings)
     if parsed is None:
@@ -2105,19 +2192,40 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
         await state.clear()
         return
     data = await state.get_data()
-    start_iso = data.get("blackout_start_iso")
-    if start_iso is None:
-        await state.clear()
-        return
-    end_parsed = parse_booking_start_text(message.text or "", settings)
-    if end_parsed is None:
-        await message.answer("Не разобрал дату конца.", parse_mode=ParseMode.HTML)
-        return
-    start_at = ensure_utc(datetime.fromisoformat(str(start_iso)))
-    end_at = ensure_utc(end_parsed)
-    if start_at is None or end_at is None or end_at <= start_at:
-        await message.answer("Конец должен быть позже начала.")
-        return
+    mode = str(data.get("blackout_mode") or "single")
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    daily_start_minute: int | None = None
+    daily_end_minute: int | None = None
+    if mode == "daily":
+        daily_start_minute = data.get("blackout_daily_start_minute")
+        if daily_start_minute is None:
+            await state.clear()
+            return
+        daily_end_minute = _parse_daily_time_to_minute(message.text or "")
+        if daily_end_minute is None:
+            await message.answer("Не разобрал время конца. Пример: <code>08:00</code>.", parse_mode=ParseMode.HTML)
+            return
+        if int(daily_start_minute) == int(daily_end_minute):
+            await message.answer("Начало и конец не должны совпадать.")
+            return
+        now_u = datetime.now(UTC)
+        start_at = now_u
+        end_at = now_u + timedelta(minutes=1)
+    else:
+        start_iso = data.get("blackout_start_iso")
+        if start_iso is None:
+            await state.clear()
+            return
+        end_parsed = parse_booking_start_text(message.text or "", settings)
+        if end_parsed is None:
+            await message.answer("Не разобрал дату конца.", parse_mode=ParseMode.HTML)
+            return
+        start_at = ensure_utc(datetime.fromisoformat(str(start_iso)))
+        end_at = ensure_utc(end_parsed)
+        if start_at is None or end_at is None or end_at <= start_at:
+            await message.answer("Конец должен быть позже начала.")
+            return
 
     admin_id = message.from_user.id
     async with db_session.async_session_maker() as session:
@@ -2138,17 +2246,28 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
             owner_user_id=admin_id,
             start_at=start_at,
             end_at=end_at,
+            is_recurring_daily=(mode == "daily"),
+            recurring_start_minute=(int(daily_start_minute) if mode == "daily" else None),
+            recurring_end_minute=(int(daily_end_minute) if mode == "daily" else None),
             created_at=now_bo,
         )
         session.add(win)
         await session.flush()
         for item in items:
-            n_res += await cancel_reservations_hit_by_blackout(
-                session, bot, settings, item, start_at, end_at
-            )
-            n_rent += await cancel_pending_rentals_hit_by_blackout(
-                session, bot, settings, item, start_at, end_at
-            )
+            if mode == "daily":
+                n_res += await cancel_reservations_hit_by_daily_blackout(
+                    session, bot, settings, item, int(daily_start_minute), int(daily_end_minute)
+                )
+                n_rent += await cancel_pending_rentals_hit_by_daily_blackout(
+                    session, bot, settings, item, int(daily_start_minute), int(daily_end_minute)
+                )
+            else:
+                n_res += await cancel_reservations_hit_by_blackout(
+                    session, bot, settings, item, start_at, end_at
+                )
+                n_rent += await cancel_pending_rentals_hit_by_blackout(
+                    session, bot, settings, item, start_at, end_at
+                )
             session.add(BlackoutWindowItem(window_id=win.id, item_id=item.id))
             names.append(item.name)
         await session.commit()
@@ -2156,9 +2275,16 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
     preview = ", ".join(escape(n) for n in names[:12])
     if len(names) > 12:
         preview += f"… (+{len(names) - 12})"
+    if mode == "daily":
+        interval_line = (
+            f"Ежедневный интервал: <b>{_fmt_daily_minute(int(daily_start_minute))}</b> — "
+            f"<b>{_fmt_daily_minute(int(daily_end_minute))}</b>."
+        )
+    else:
+        interval_line = f"Интервал: {format_local_time(start_at, settings)} — {format_local_time(end_at, settings)}."
     await message.answer(
         f"Окно неактива добавлено для <b>{len(names)}</b> вещей: {preview}\n"
-        f"Интервал: {format_local_time(start_at, settings)} — {format_local_time(end_at, settings)}.\n"
+        f"{interval_line}\n"
         f"В <code>/list_blackouts</code> — <b>один</b> id на всё это окно; <code>/delete_blackout</code> снимет его со всех вещей.\n"
         f"Снято броней: {n_res}, заявок на выдачу (ожидают админа): {n_rent}.",
         parse_mode=ParseMode.HTML,
@@ -2176,7 +2302,10 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
             select(AdminBlackoutWindow)
             .where(
                 AdminBlackoutWindow.owner_user_id == uid,
-                AdminBlackoutWindow.end_at > now,
+                or_(
+                    AdminBlackoutWindow.is_recurring_daily.is_(True),
+                    AdminBlackoutWindow.end_at > now,
+                ),
             )
             .options(
                 selectinload(AdminBlackoutWindow.window_items).selectinload(BlackoutWindowItem.item)
@@ -2205,12 +2334,20 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
         nick = ", ".join(nm[:16])
         if len(nm) > 16:
             nick += f"… <i>(+{len(nm) - 16})</i>"
-        line = (
-            f"• id <code>{w.id}</code> — <b>общее окно</b> ({len(w.window_items)} вещей)\n"
-            f"  {format_local_time(w.start_at, settings)} — {format_local_time(w.end_at, settings)}\n"
-            f"  <i>{nick}</i>"
-        )
-        chunks.append((w.start_at, line))
+        if w.is_recurring_daily and w.recurring_start_minute is not None and w.recurring_end_minute is not None:
+            line = (
+                f"• id <code>{w.id}</code> — <b>ежедневное окно</b> ({len(w.window_items)} вещей)\n"
+                f"  {_fmt_daily_minute(int(w.recurring_start_minute))} — {_fmt_daily_minute(int(w.recurring_end_minute))}\n"
+                f"  <i>{nick}</i>"
+            )
+            chunks.append((w.created_at, line))
+        else:
+            line = (
+                f"• id <code>{w.id}</code> — <b>общее окно</b> ({len(w.window_items)} вещей)\n"
+                f"  {format_local_time(w.start_at, settings)} — {format_local_time(w.end_at, settings)}\n"
+                f"  <i>{nick}</i>"
+            )
+            chunks.append((w.start_at, line))
     for bo in legacy:
         it = bo.item
         name = escape(it.name if it else "?")
@@ -2224,7 +2361,7 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
     lines = [c[1] for c in chunks]
     text = (
         "<b>Предстоящие окна неактива выдачи</b>\n"
-        "<i>Окно из /add_blackout — одна строка и один id на все вещи; «одна вещь» — только старые записи. Прошедшие не показываются.</i>\n\n"
+        "<i>Окно из /add_blackout — одна строка и один id на все вещи (включая ежедневные); «одна вещь» — только старые записи.</i>\n\n"
         + "\n\n".join(lines)
     )
     if len(text) > 4000:

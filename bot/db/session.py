@@ -178,6 +178,28 @@ async def _migrate_sqlite_rental_handover_stat_actor(conn) -> None:
         )
 
 
+async def _migrate_sqlite_admin_blackout_recurring(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(admin_blackout_windows)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "is_recurring_daily" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE admin_blackout_windows "
+                "ADD COLUMN is_recurring_daily BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    if "recurring_start_minute" not in cols:
+        await conn.execute(
+            text("ALTER TABLE admin_blackout_windows ADD COLUMN recurring_start_minute INTEGER")
+        )
+    if "recurring_end_minute" not in cols:
+        await conn.execute(
+            text("ALTER TABLE admin_blackout_windows ADD COLUMN recurring_end_minute INTEGER")
+        )
+
+
 async def init_db() -> None:
     if engine is None:
         raise RuntimeError("Engine not configured")
@@ -193,6 +215,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_blackout_window(conn)
         await _migrate_sqlite_item_blackout_subscription_cols(conn)
         await _migrate_sqlite_rental_handover_stat_actor(conn)
+        await _migrate_sqlite_admin_blackout_recurring(conn)
 
     if async_session_maker is not None:
         async with async_session_maker() as session:

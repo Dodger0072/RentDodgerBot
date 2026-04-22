@@ -39,9 +39,9 @@ from bot.services.admin_notify import (
     notify_admins_user_cancelled_reservation,
 )
 from bot.services.booking_schedule import (
+    blackout_max_end_covering_point_db,
     explain_booking_start_conflict,
     format_user_booking_availability_block,
-    load_blackout_intervals_utc,
     load_rr_busy_intervals_utc,
     max_hours_from_start,
     max_reservation_end_utc,
@@ -772,8 +772,7 @@ async def user_book_start_datetime(message: Message, state: FSMContext, settings
             await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
             return
         rr = await load_rr_busy_intervals_utc(session, item_id)
-        bo = await load_blackout_intervals_utc(session, item_id)
-        if point_inside_busy(parsed, bo) or point_inside_busy(parsed, rr):
+        if (await blackout_max_end_covering_point_db(session, item_id, parsed)) is not None or point_inside_busy(parsed, rr):
             msg = await explain_booking_start_conflict(session, item_id, parsed, settings)
             avail = await format_user_booking_availability_block(
                 session, item_id, item, settings, now=now

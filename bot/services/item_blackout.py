@@ -46,6 +46,21 @@ def _handover_start_inside_blackout(
     return bs <= rs < be
 
 
+def _handover_start_inside_daily_blackout(
+    slot_start: datetime, start_minute: int, end_minute: int, settings: Settings
+) -> bool:
+    rs = ensure_utc(slot_start)
+    if rs is None:
+        return False
+    local = rs.astimezone(settings.display_tz)
+    minute = local.hour * 60 + local.minute
+    if start_minute == end_minute:
+        return False
+    if start_minute < end_minute:
+        return start_minute <= minute < end_minute
+    return minute >= start_minute or minute < end_minute
+
+
 async def cancel_reservations_hit_by_blackout(
     session: AsyncSession,
     bot: Bot,
@@ -105,6 +120,88 @@ async def cancel_pending_rentals_hit_by_blackout(
         if rs is None or re_ is None:
             continue
         if not _handover_start_inside_blackout(rs, bs, be):
+            continue
+        text = blackout_user_cancel_rental_text(item, rental, settings)
+        uid = rental.user_id
+        try:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+        except TelegramForbiddenError:
+            pass
+        except TelegramBadRequest:
+            pass
+        except Exception:
+            pass
+        cid, mid = rental.admin_message_chat_id, rental.admin_message_id
+        if cid is not None and mid is not None:
+            try:
+                await bot.edit_message_text(
+                    "<i>Заявка отменена: арендодатель недоступен в это время.</i>",
+                    chat_id=int(cid),
+                    message_id=int(mid),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramBadRequest:
+                pass
+            except TelegramForbiddenError:
+                pass
+            except Exception:
+                pass
+        await session.delete(rental)
+        removed += 1
+    return removed
+
+
+async def cancel_reservations_hit_by_daily_blackout(
+    session: AsyncSession,
+    bot: Bot,
+    settings: Settings,
+    item: Item,
+    start_minute: int,
+    end_minute: int,
+) -> int:
+    r = await session.execute(select(Reservation).where(Reservation.item_id == item.id))
+    removed = 0
+    for res in list(r.scalars().unique()):
+        rs = ensure_utc(res.start_at)
+        if rs is None:
+            continue
+        if not _handover_start_inside_daily_blackout(rs, start_minute, end_minute, settings):
+            continue
+        text = blackout_user_cancel_text(item, res, settings)
+        uid = res.user_id
+        try:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+        except TelegramForbiddenError:
+            pass
+        except TelegramBadRequest:
+            pass
+        except Exception:
+            pass
+        await session.delete(res)
+        removed += 1
+    return removed
+
+
+async def cancel_pending_rentals_hit_by_daily_blackout(
+    session: AsyncSession,
+    bot: Bot,
+    settings: Settings,
+    item: Item,
+    start_minute: int,
+    end_minute: int,
+) -> int:
+    r = await session.execute(
+        select(Rental).where(
+            Rental.item_id == item.id,
+            Rental.state == RentalState.pending_admin.value,
+        )
+    )
+    removed = 0
+    for rental in list(r.scalars().unique()):
+        rs = ensure_utc(rental.start_at)
+        if rs is None:
+            continue
+        if not _handover_start_inside_daily_blackout(rs, start_minute, end_minute, settings):
             continue
         text = blackout_user_cancel_rental_text(item, rental, settings)
         uid = rental.user_id

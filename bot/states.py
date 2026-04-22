@@ -55,6 +55,7 @@ class AdminReservationStates(StatesGroup):
 
 
 class AdminBlackoutStates(StatesGroup):
+    waiting_mode = State()
     waiting_start = State()
     waiting_end = State()
 
