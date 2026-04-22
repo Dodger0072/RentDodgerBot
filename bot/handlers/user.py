@@ -593,6 +593,7 @@ async def user_become_owner_info(query: CallbackQuery) -> None:
             url="https://teletype.in/@dodger0072/Ngzb73srIY0",
         )
     )
+    kb.row(InlineKeyboardButton(text="« Назад", callback_data="u:home"))
     text = (
         "Если вы желаете сдавать свои вещи, то обратитесь к администратору @Dodger0072.\n\n"
         "Внимание! Если вы хотите сдавать вещи платно, то с вас будет браться комиссия 10% "
