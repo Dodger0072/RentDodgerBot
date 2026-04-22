@@ -116,6 +116,26 @@ async def _migrate_sqlite_item_blackout_window(conn) -> None:
         )
 
 
+async def _migrate_sqlite_item_blackout_subscription_cols(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(item_blackouts)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "invoice_id" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE item_blackouts ADD COLUMN invoice_id INTEGER "
+                "REFERENCES weekly_invoices(id) ON DELETE SET NULL"
+            )
+        )
+    if "created_by_system" not in cols:
+        await conn.execute(
+            text("ALTER TABLE item_blackouts ADD COLUMN created_by_system BOOLEAN NOT NULL DEFAULT 0")
+        )
+    if "reason_code" not in cols:
+        await conn.execute(text("ALTER TABLE item_blackouts ADD COLUMN reason_code VARCHAR(64)"))
+
+
 async def migrate_blackout_window_links(session: AsyncSession) -> None:
     """Переносит связь общего окна из дублей item_blackouts в blackout_window_items (одно окно — без N строк в списке)."""
     r = await session.execute(select(ItemBlackout).where(ItemBlackout.window_id.is_not(None)))
@@ -171,6 +191,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
         await _migrate_sqlite_item_blackout_window(conn)
+        await _migrate_sqlite_item_blackout_subscription_cols(conn)
         await _migrate_sqlite_rental_handover_stat_actor(conn)
 
     if async_session_maker is not None:

@@ -21,6 +21,7 @@ from bot.db.session import init_db, setup_engine
 from bot.handlers import admin, common, user
 from bot.middlewares import BanMiddleware, SettingsMiddleware
 from bot.services.reservation_reminders import reservation_reminder_loop
+from bot.services.subscription_billing import subscription_billing_loop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ def _admin_commands() -> list[BotCommand]:
         BotCommand(command="list_bans", description="Список заблокированных"),
         BotCommand(command="ban", description="Заблокировать пользователя"),
         BotCommand(command="unban", description="Снять блокировку"),
+        BotCommand(command="issue_invoice_now", description="Суперадмин: выставить счёт сейчас"),
+        BotCommand(command="item_logs", description="Суперадмин: логи заявок/решений"),
     ]
 
 
@@ -105,6 +108,7 @@ async def main() -> None:
 
     await _setup_bot_commands(bot, settings)
     asyncio.create_task(reservation_reminder_loop(bot, settings))
+    asyncio.create_task(subscription_billing_loop(bot, settings))
 
     await dp.start_polling(bot)
 

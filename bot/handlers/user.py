@@ -55,7 +55,7 @@ from bot.services.booking_schedule import (
     user_may_cancel_reservation,
 )
 from bot.services.item_order import non_empty_rental_category_menu_rows
-from bot.services.item_owner import landlord_contact_hint_html
+from bot.services.item_owner import item_notification_recipients, landlord_contact_hint_html
 from bot.services.rental import (
     can_take_immediate_rent,
     ensure_utc,
@@ -68,8 +68,9 @@ from bot.services.rental import (
     rent_hours_bounds,
     user_facing_status,
 )
+from bot.services.rental_logs import log_rental_event
 from bot.services.user_discipline import booking_rules_block, near_ban_notice_for_user
-from bot.states import UserBookStates, UserRentStates
+from bot.states import UserBookStates, UserComplaintStates, UserRentStates
 
 router = Router(name="user")
 
@@ -583,6 +584,59 @@ async def user_home(query: CallbackQuery, state: FSMContext, settings: Settings)
     await query.answer()
 
 
+@router.callback_query(F.data.regexp(r"^u:complaint:(ok|rej):(\d+):(\d+)$"))
+async def user_complaint_start(query: CallbackQuery, state: FSMContext) -> None:
+    parts = (query.data or "").split(":")
+    kind = parts[2]
+    rental_id = int(parts[3])
+    owner_user_id = int(parts[4])
+    await state.set_state(UserComplaintStates.waiting_text)
+    await state.update_data(
+        complaint_kind=kind,
+        complaint_rental_id=rental_id,
+        complaint_owner_user_id=owner_user_id,
+    )
+    await query.message.answer(
+        "Опишите жалобу одним сообщением. Мы отправим её суперадмину.\n"
+        "Напишите, что произошло (грубость, обман по сумме и т.д.)."
+    )
+    await query.answer()
+
+
+@router.message(UserComplaintStates.waiting_text, F.text)
+async def user_complaint_submit(message: Message, state: FSMContext, settings: Settings) -> None:
+    if (message.text or "").strip().startswith("/"):
+        await state.clear()
+        await message.answer("Отправка жалобы отменена.")
+        return
+    complaint = (message.text or "").strip()
+    if len(complaint) < 5:
+        await message.answer("Опишите подробнее (минимум 5 символов).")
+        return
+    data = await state.get_data()
+    kind = str(data.get("complaint_kind") or "")
+    rental_id = int(data.get("complaint_rental_id") or 0)
+    owner_user_id = int(data.get("complaint_owner_user_id") or 0)
+    kind_title = "после подтверждения выдачи" if kind == "ok" else "после отклонения заявки"
+    uname = (message.from_user.username or "").strip().lstrip("@")
+    who = f"@{escape(uname)}" if uname else f"id <code>{message.from_user.id}</code>"
+    text = (
+        "<b>Жалоба от арендатора</b>\n"
+        f"Пользователь: {who} (id <code>{message.from_user.id}</code>)\n"
+        f"Арендодатель: id <code>{owner_user_id}</code>\n"
+        f"Контекст: {escape(kind_title)}\n"
+        f"Заявка rental_id: <code>{rental_id}</code>\n\n"
+        f"<b>Текст жалобы:</b>\n{escape(complaint)}"
+    )
+    for su in sorted(settings.superadmin_user_ids):
+        try:
+            await message.bot.send_message(su, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            continue
+    await state.clear()
+    await message.answer("Жалоба отправлена суперадмину. Спасибо.")
+
+
 @router.callback_query(F.data.regexp(r"^take:(\d+)$"))
 async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     item_id = int(query.data.split(":")[1])
@@ -872,6 +926,20 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
         )
         session.add(rental)
         await session.flush()
+        recips = item_notification_recipients(item, settings)
+        owner_uid = int(item.owner_user_id) if item.owner_user_id is not None else int(recips[0] if recips else 0)
+        await log_rental_event(
+            session,
+            item_id=item.id,
+            owner_user_id=int(owner_uid),
+            rental_id=rental.id,
+            renter_user_id=query.from_user.id,
+            renter_username=query.from_user.username,
+            event_type="request_created",
+            requested_hours=hours,
+            chosen_hours=None,
+            note="Прямая заявка из каталога",
+        )
         await notify_admins_pending_rental(bot, settings, session, rental, item, total, planned_end)
         contact_html = await landlord_contact_hint_html(bot, item, settings)
         await session.commit()

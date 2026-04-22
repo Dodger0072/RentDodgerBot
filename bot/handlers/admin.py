@@ -30,6 +30,7 @@ from bot.db.models import (
     RentalState,
     Reservation,
     UserBan,
+    WeeklyInvoiceItem,
 )
 from bot.db import session as db_session
 from bot.keyboards.inline import (
@@ -64,6 +65,19 @@ from bot.services.rental import (
 )
 from bot.services.admin_notify import notify_superadmins_discipline_warning
 from bot.services.rental_stats import fetch_rental_stats, record_handover_stat
+from bot.services.rental_logs import (
+    admins_with_log_activity,
+    items_with_logs_for_admin,
+    latest_logs_for_admin_item,
+    log_rental_event,
+)
+from bot.services.subscription_billing import (
+    apply_payment_review,
+    build_invoices_for_range_and_notify,
+    current_week_range,
+    notify_superadmins_about_proof,
+    register_payment_proof,
+)
 from bot.services.user_bans import (
     add_ban,
     is_user_banned,
@@ -395,6 +409,12 @@ async def admin_panel_delete_blackout(query: CallbackQuery, settings: Settings) 
             await session.rollback()
             await query.message.answer("Удаляйте по id общего окна из /list_blackouts.")
             return
+        if bo.created_by_system and not is_superadmin(uid, settings):
+            await session.rollback()
+            await query.message.answer(
+                "Это системный blackout из-за долга по комиссии. Снять его может только суперадмин после подтверждения оплаты."
+            )
+            return
         if not admin_manages_item(uid, bo.item):
             await session.rollback()
             await query.message.answer("Это окно на чужой вещи.")
@@ -442,12 +462,35 @@ def _edit_item_header_html(item: Item) -> str:
     )
 
 
+def _landlord_tag_html(owner_user_id: int | None, owner_username: str | None) -> str:
+    u = (owner_username or "").strip().lstrip("@")
+    if u:
+        return f"@{escape(u)}"
+    if owner_user_id is not None:
+        return f"id <code>{int(owner_user_id)}</code>"
+    return "администратора"
+
+
+def _user_complaint_keyboard(kind: str, rental_id: int, owner_user_id: int) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="Оставить жалобу",
+            callback_data=f"u:complaint:{kind}:{rental_id}:{owner_user_id}",
+        )
+    )
+    b.row(InlineKeyboardButton(text="« К каталогу", callback_data="u:home"))
+    return b
+
+
 async def _finalize_rental_handover(
+    bot: Bot,
     session: AsyncSession,
     rental_id: int,
     hours: int,
     settings: Settings,
     acting_user_id: int,
+    acting_username: str | None,
 ) -> tuple[bool, str]:
     now = datetime.now(UTC)
     r = await session.execute(select(Rental).where(Rental.id == rental_id))
@@ -467,7 +510,7 @@ async def _finalize_rental_handover(
     rental.start_at = now
     rental.end_at = end
     try:
-        total = price_for_hours(item, req_hours)
+        total = price_for_hours(item, hours)
     except ValueError:
         total = Decimal("0")
     record_handover_stat(
@@ -477,13 +520,43 @@ async def _finalize_rental_handover(
         handed_over_at=now,
         handed_over_by_user_id=acting_user_id,
     )
+    owner_uid = int(item.owner_user_id) if item.owner_user_id is not None else int(acting_user_id)
+    await log_rental_event(
+        session,
+        item_id=item.id,
+        owner_user_id=owner_uid,
+        rental_id=rental.id,
+        renter_user_id=rental.user_id,
+        renter_username=rental.username,
+        event_type="handover_ok",
+        requested_hours=req_hours,
+        chosen_hours=hours,
+        note="Вещь сдана",
+    )
     await record_successful_handover(session, rental.user_id, rental.username)
     await session.commit()
     end_label = format_local_time(end, settings)
     text = (
         f"Вещь сдана на {hours} ч. Аренда активна до {end_label}.\n"
-        f"Сумма по заявке пользователя ({req_hours} ч): {format_money(total)}."
+        f"Сумма по подтверждённому сроку ({hours} ч): {format_money(total)}.\n"
+        f"Изначально в заявке было: {req_hours} ч."
     )
+    owner_uid = int(item.owner_user_id) if item.owner_user_id is not None else int(acting_user_id)
+    owner_un = item.owner_username if item.owner_user_id is not None else acting_username
+    owner_tag = _landlord_tag_html(owner_uid, owner_un)
+    user_text = (
+        "✅ <b>Вы успешно взяли вещь в аренду.</b>\n"
+        f"У арендодателя {owner_tag}.\n\n"
+        f"Срок: <b>{hours} ч.</b>\n"
+        f"Сумма: <b>{format_money(total)}</b>\n\n"
+        "Если арендодатель вам грубил или сумма в заявке и по факту не совпала, "
+        "вы можете оставить жалобу кнопкой ниже."
+    )
+    kb = _user_complaint_keyboard("ok", rental.id, owner_uid).as_markup()
+    try:
+        await bot.send_message(rental.user_id, user_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
     return True, text
 
 
@@ -2058,8 +2131,9 @@ async def cmd_list_blackouts(message: Message, settings: Settings) -> None:
     for bo in legacy:
         it = bo.item
         name = escape(it.name if it else "?")
+        kind = "системный долг" if bo.created_by_system else "одна вещь"
         line = (
-            f"• id <code>{bo.id}</code> — <b>одна вещь</b> | {name}\n"
+            f"• id <code>{bo.id}</code> — <b>{kind}</b> | {name}\n"
             f"  {format_local_time(bo.start_at, settings)} — {format_local_time(bo.end_at, settings)}"
         )
         chunks.append((bo.start_at, line))
@@ -2123,6 +2197,12 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
                 return
             await session.rollback()
             await message.answer("Удаляйте по id общего окна из /list_blackouts.")
+            return
+        if bo.created_by_system and not is_superadmin(uid, settings):
+            await session.rollback()
+            await message.answer(
+                "Это системный blackout из-за долга по комиссии. Снять его может только суперадмин после подтверждения оплаты."
+            )
             return
         if not admin_manages_item(uid, bo.item):
             await session.rollback()
@@ -2225,6 +2305,136 @@ def _rent_stats_item_keyboard(items: list[Item], selected_item_id: int | None = 
             )
         )
     return kb.as_markup()
+
+
+def _item_logs_admin_keyboard(admin_ids: list[int]) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for uid in admin_ids:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"Админ {uid}",
+                callback_data=f"adm:ilog:admin:{uid}",
+            )
+        )
+    return kb
+
+
+def _item_logs_items_keyboard(admin_user_id: int, rows) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        iid = row.item_id if row.item_id is not None else 0
+        title = escape(row.item_name)
+        kb.row(
+            InlineKeyboardButton(
+                text=f"#{iid} {title} ({row.events_count})",
+                callback_data=f"adm:ilog:item:{admin_user_id}:{iid}",
+            )
+        )
+    kb.row(InlineKeyboardButton(text="<< К выбору админа", callback_data="adm:ilog:pick_admin"))
+    return kb
+
+
+def _log_event_line(ev, settings: Settings) -> str:
+    when = format_local_time(ev.created_at, settings)
+    uname = escape((ev.renter_username or "—").lstrip("@"))
+    if ev.event_type == "request_created":
+        return (
+            f"• {when} — <b>Заявка</b> от @{uname} (id {ev.renter_user_id}), "
+            f"запрос: {ev.requested_hours or '?'} ч. {escape(ev.note or '')}"
+        )
+    if ev.event_type == "handover_ok":
+        return (
+            f"• {when} — <b>Решение: сдал</b> @{uname} (id {ev.renter_user_id}), "
+            f"запрос {ev.requested_hours or '?'} ч, выдано {ev.chosen_hours or '?'} ч."
+        )
+    if ev.event_type == "handover_rejected":
+        note = f" Причина: {escape(ev.note)}" if ev.note else ""
+        return (
+            f"• {when} — <b>Решение: не сдал</b> @{uname} (id {ev.renter_user_id}), "
+            f"запрос {ev.requested_hours or '?'} ч.{note}"
+        )
+    return f"• {when} — {escape(ev.event_type)}"
+
+
+@router.message(Command("item_logs"))
+async def cmd_item_logs(message: Message, settings: Settings) -> None:
+    if not is_superadmin(message.from_user.id, settings):
+        return
+    async with db_session.async_session_maker() as session:
+        admin_ids = await admins_with_log_activity(session)
+        await session.commit()
+    if not admin_ids:
+        await message.answer("Логи пока пусты.")
+        return
+    kb = _item_logs_admin_keyboard(admin_ids)
+    await message.answer("Выберите администратора для просмотра логов:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "adm:ilog:pick_admin")
+async def item_logs_pick_admin(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    async with db_session.async_session_maker() as session:
+        admin_ids = await admins_with_log_activity(session)
+        await session.commit()
+    if not admin_ids:
+        await query.answer("Логи пусты", show_alert=True)
+        return
+    await query.message.edit_text(
+        "Выберите администратора для просмотра логов:",
+        reply_markup=_item_logs_admin_keyboard(admin_ids).as_markup(),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:ilog:admin:(\d+)$"))
+async def item_logs_pick_item(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    admin_user_id = int((query.data or "").split(":")[3])
+    async with db_session.async_session_maker() as session:
+        rows = await items_with_logs_for_admin(session, admin_user_id)
+        await session.commit()
+    if not rows:
+        await query.answer("По этому админу логов нет", show_alert=True)
+        return
+    kb = _item_logs_items_keyboard(admin_user_id, rows)
+    await query.message.edit_text(
+        f"Админ <code>{admin_user_id}</code>. Выберите вещь:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb.as_markup(),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm:ilog:item:(\d+):(-?\d+)$"))
+async def item_logs_show(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    admin_user_id = int(parts[3])
+    raw_item_id = int(parts[4])
+    item_id = None if raw_item_id == 0 else raw_item_id
+    async with db_session.async_session_maker() as session:
+        events = await latest_logs_for_admin_item(
+            session, admin_user_id=admin_user_id, item_id=item_id, limit=60
+        )
+        await session.commit()
+    if not events:
+        await query.answer("События не найдены", show_alert=True)
+        return
+    title = f"Логи по админу <code>{admin_user_id}</code>, вещь <code>{raw_item_id}</code>"
+    lines = [_log_event_line(ev, settings) for ev in events]
+    text = f"<b>Журнал действий</b>\n{title}\n\n" + "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    back = InlineKeyboardBuilder()
+    back.row(InlineKeyboardButton(text="<< К вещам", callback_data=f"adm:ilog:admin:{admin_user_id}"))
+    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=back.as_markup())
+    await query.answer()
 
 
 @router.message(Command("bookings"))
@@ -2391,6 +2601,58 @@ async def cmd_rent_stats(message: Message, settings: Settings) -> None:
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+@router.message(Command("issue_invoice_now"))
+async def cmd_issue_invoice_now(message: Message, settings: Settings) -> None:
+    if not is_superadmin(message.from_user.id, settings):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    target_user_id: int | None = None
+    if len(parts) > 1 and parts[1].strip():
+        raw = parts[1].strip()
+        if raw.startswith("@"):
+            uname = normalize_username(raw)
+            if uname is None:
+                await message.answer("Неверный username. Пример: /issue_invoice_now @nick")
+                return
+            async with db_session.async_session_maker() as session:
+                resolved = await resolve_user_id_by_username_norm(session, uname)
+                await session.commit()
+            if resolved is None:
+                await message.answer(
+                    "Не смог определить user_id по этому username. Пусть админ сначала поработает с ботом."
+                )
+                return
+            target_user_id = int(resolved)
+        else:
+            try:
+                target_user_id = int(raw)
+            except ValueError:
+                await message.answer(
+                    "Использование: /issue_invoice_now [@username|user_id]\n"
+                    "Без аргумента — выставить всем, с аргументом — только одному админу."
+                )
+                return
+    week = current_week_range(settings)
+    await build_invoices_for_range_and_notify(
+        message.bot,
+        settings,
+        start_utc=week.start_utc,
+        end_utc=week.end_utc,
+        force_notify=True,
+        owner_user_id=target_user_id,
+    )
+    if target_user_id is None:
+        await message.answer(
+            "Счета выставлены принудительно за текущую неделю "
+            "(с понедельника 00:00 до конца этой недели по локальному времени бота)."
+        )
+    else:
+        await message.answer(
+            f"Счёт выставлен принудительно админу <code>{target_user_id}</code> за текущую неделю.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 @router.callback_query(F.data == "adm:rst:all")
 async def admin_rent_stats_all(query: CallbackQuery, settings: Settings) -> None:
     if not _admin_only(settings, query.from_user.id, query.from_user.username):
@@ -2447,6 +2709,84 @@ async def admin_rent_stats_by_item(query: CallbackQuery, settings: Settings) -> 
         reply_markup=_rent_stats_item_keyboard(managed_items, selected_item_id=item_id),
     )
     await query.answer()
+
+
+def _payment_result_text(action: str) -> str:
+    if action == "approve":
+        return "✅ Оплата подтверждена. Долг закрыт, системный blackout снят."
+    if action == "reject":
+        return "❌ Оплата отклонена. Долг остаётся открытым."
+    return "↩️ Оплата отправлена на доработку. Долг остаётся открытым."
+
+
+@router.message(StateFilter(None), F.photo)
+async def admin_collect_payment_screenshot(message: Message, settings: Settings) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        return
+    file_id = message.photo[-1].file_id
+    note = (message.caption or "").strip()
+    async with db_session.async_session_maker() as session:
+        invoice, proof, err = await register_payment_proof(
+            session,
+            owner_user_id=message.from_user.id,
+            screenshot_file_id=file_id,
+            note=note,
+        )
+        if err is not None:
+            await session.rollback()
+            await message.answer(err)
+            return
+        q_items = await session.execute(
+            select(WeeklyInvoiceItem)
+            .where(WeeklyInvoiceItem.invoice_id == invoice.id)
+            .order_by(WeeklyInvoiceItem.id.asc())
+        )
+        item_rows = list(q_items.scalars().unique())
+        await notify_superadmins_about_proof(message.bot, settings, invoice, proof, item_rows)
+        await session.commit()
+    await message.answer("Скрин оплаты принят и отправлен суперадмину на проверку.")
+
+
+@router.callback_query(F.data.regexp(r"^adm:inv:(approve|reject|rework):(\d+)$"))
+async def superadmin_invoice_review(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    action, proof_raw = query.data.split(":")[2], query.data.split(":")[3]
+    proof_id = int(proof_raw)
+    async with db_session.async_session_maker() as session:
+        _proof, invoice, err = await apply_payment_review(
+            session,
+            proof_id=proof_id,
+            reviewer_user_id=query.from_user.id,
+            action=action,
+        )
+        if err is not None:
+            await session.rollback()
+            await query.answer(err, show_alert=True)
+            return
+        owner_user_id = int(invoice.owner_user_id)
+        total_due = Decimal(invoice.total_due)
+        await session.commit()
+    await query.answer("Статус обновлён")
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    result_text = _payment_result_text(action)
+    try:
+        await query.bot.send_message(
+            owner_user_id,
+            (
+                "<b>Проверка оплаты по недельному счёту</b>\n\n"
+                f"{result_text}\n"
+                f"Сумма счёта: {format_money(total_due)}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    await query.message.answer(result_text)
 
 
 @router.callback_query(F.data == "adm:res:abort")
@@ -2672,6 +3012,23 @@ async def _finalize_rental_not_handed(
         uid = rental.user_id
         req_h = rental.requested_hours
         item_name = rental.item.name if rental.item else "?"
+        owner_uid = (
+            int(rental.item.owner_user_id)
+            if rental.item is not None and rental.item.owner_user_id is not None
+            else int(acting_user_id)
+        )
+        await log_rental_event(
+            session,
+            item_id=rental.item_id,
+            owner_user_id=owner_uid,
+            rental_id=rental.id,
+            renter_user_id=rental.user_id,
+            renter_username=rental.username,
+            event_type="handover_rejected",
+            requested_hours=req_h,
+            chosen_hours=None,
+            note=reason_plain,
+        )
         await session.delete(rental)
         await session.commit()
 
@@ -2679,14 +3036,21 @@ async def _finalize_rental_not_handed(
         reason_block = f"\n<b>Причина:</b> {escape(reason_plain)}"
     else:
         reason_block = ""
-    user_text = (
-        "❌ <b>Вещь не сдана.</b> Заявка на аренду снята.\n\n"
-        f"Вещь: <b>{escape(item_name)}</b>\n"
-        f"Часов по заявке: {req_h}"
-        f"{reason_block}"
+    owner_tag = _landlord_tag_html(
+        rental.item.owner_user_id if rental.item is not None else acting_user_id,
+        rental.item.owner_username if rental.item is not None else None,
     )
+    user_text = (
+        "❌ <b>Арендодатель отменил вашу заявку.</b>\n\n"
+        f"Вещь: <b>{escape(item_name)}</b>\n"
+        f"Арендодатель: {owner_tag}\n"
+        f"Часов по заявке: {req_h}"
+        f"{reason_block}\n\n"
+        "Если вам грубили или пытались обмануть, вы можете оставить жалобу кнопкой ниже."
+    )
+    kb = _user_complaint_keyboard("rej", rental_id, owner_uid).as_markup()
     try:
-        await bot.send_message(uid, user_text, parse_mode=ParseMode.HTML)
+        await bot.send_message(uid, user_text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except TelegramForbiddenError:
         pass
     except TelegramBadRequest:
@@ -3009,7 +3373,7 @@ async def admin_rental_hours(query: CallbackQuery, state: FSMContext, settings: 
     hours = int(parts[4])
     async with db_session.async_session_maker() as session:
         ok, text = await _finalize_rental_handover(
-            session, rid, hours, settings, query.from_user.id
+            query.bot, session, rid, hours, settings, query.from_user.id, query.from_user.username
         )
     if not ok:
         await query.answer(text, show_alert=True)
@@ -3053,7 +3417,13 @@ async def admin_handover_hours_text(message: Message, state: FSMContext, setting
         return
     async with db_session.async_session_maker() as session:
         ok, text = await _finalize_rental_handover(
-            session, int(rid), hours, settings, message.from_user.id
+            message.bot,
+            session,
+            int(rid),
+            hours,
+            settings,
+            message.from_user.id,
+            message.from_user.username,
         )
     if not ok:
         await message.answer(text)

@@ -123,6 +123,12 @@ class ItemBlackout(Base):
         ForeignKey("admin_blackout_windows.id", ondelete="CASCADE"),
         nullable=True,
     )
+    invoice_id: Mapped[int | None] = mapped_column(
+        ForeignKey("weekly_invoices.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_by_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -143,6 +149,86 @@ class RentalHandoverStat(Base):
     handed_over_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     handed_over_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WeeklyInvoice(Base):
+    __tablename__ = "weekly_invoices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    week_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    week_end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    total_earned: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    total_due: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="awaiting_payment")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    items: Mapped[List["WeeklyInvoiceItem"]] = relationship(
+        back_populates="invoice", cascade="all, delete-orphan"
+    )
+    proofs: Mapped[List["PaymentProof"]] = relationship(
+        back_populates="invoice", cascade="all, delete-orphan"
+    )
+
+
+class WeeklyInvoiceItem(Base):
+    __tablename__ = "weekly_invoice_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("weekly_invoices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    item_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    earned: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    due: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    invoice: Mapped["WeeklyInvoice"] = relationship(back_populates="items")
+
+
+class PaymentProof(Base):
+    __tablename__ = "payment_proofs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("weekly_invoices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    screenshot_file_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_review")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_comment: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    invoice: Mapped["WeeklyInvoice"] = relationship(back_populates="proofs")
+
+
+class RentalDecisionLog(Base):
+    __tablename__ = "rental_decision_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    owner_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    rental_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    renter_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    renter_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chosen_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class Rental(Base):

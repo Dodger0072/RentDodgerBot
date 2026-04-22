@@ -16,6 +16,7 @@ from bot.config import Settings
 from bot.db import session as db_session
 from bot.db.models import Rental, RentalState, Reservation
 from bot.services.admin_notify import notify_admins_pending_rental
+from bot.services.rental_logs import log_rental_event
 from bot.services.item_owner import booking_reminder_recipient_ids, landlord_contact_hint_html
 from bot.services.rental import ensure_utc, expire_expired_rentals, price_for_hours
 from bot.time_format import format_local_time
@@ -188,6 +189,21 @@ async def process_reservation_booking_starts(bot: Bot, settings: Settings) -> No
             session.add(rental)
             await session.delete(res)
             await session.flush()
+            owner_uid = int(item.owner_user_id) if item.owner_user_id is not None else int(
+                (booking_reminder_recipient_ids(item, settings) or [0])[0]
+            )
+            await log_rental_event(
+                session,
+                item_id=item.id,
+                owner_user_id=owner_uid,
+                rental_id=rental.id,
+                renter_user_id=rental.user_id,
+                renter_username=rental.username,
+                event_type="request_created",
+                requested_hours=rental.requested_hours,
+                chosen_hours=None,
+                note="Автозаявка из начала брони",
+            )
             try:
                 await notify_admins_pending_rental(
                     bot,

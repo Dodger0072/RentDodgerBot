@@ -38,6 +38,10 @@ class UserBookStates(StatesGroup):
     waiting_confirm = State()
 
 
+class UserComplaintStates(StatesGroup):
+    waiting_text = State()
+
+
 class AdminRentalStates(StatesGroup):
     """«Вещь сдана» — ждём срок; «не сдана» — опционально текст причины для пользователя."""
 
