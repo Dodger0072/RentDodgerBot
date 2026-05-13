@@ -153,6 +153,22 @@ def _fmt_daily_minute(minute: int) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def _parse_time_only_to_utc(text: str, settings: Settings) -> datetime | None:
+    """Parse bare HH:MM (no date) and attach today's date in display_tz, then convert to UTC."""
+    m = re.match(r"^\s*(\d{1,2})\D(\d{1,2})\s*$", (text or "").strip())
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    today = datetime.now(settings.display_tz).date()
+    try:
+        local = datetime(today.year, today.month, today.day, hh, mm, tzinfo=settings.display_tz)
+    except ValueError:
+        return None
+    return local.astimezone(UTC)
+
+
 def _blackout_mode_keyboard() -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
     b.row(
@@ -2135,7 +2151,11 @@ async def blackout_mode_pick(query: CallbackQuery, state: FSMContext) -> None:
     if mode == "single":
         await state.update_data(blackout_mode="single")
         await state.set_state(AdminBlackoutStates.waiting_start)
-        await query.message.answer("Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>", parse_mode=ParseMode.HTML)
+        await query.message.answer(
+            "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+            "Или просто <code>ЧЧ:ММ</code> — тогда будет сегодняшняя дата.",
+            parse_mode=ParseMode.HTML,
+        )
         await _safe_query_answer(query)
         return
     await state.update_data(blackout_mode="daily")
@@ -2161,7 +2181,8 @@ async def blackout_mode(message: Message, state: FSMContext, settings: Settings)
         await state.update_data(blackout_mode="single")
         await state.set_state(AdminBlackoutStates.waiting_start)
         await message.answer(
-            "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+            "Начало окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+            "Или просто <code>ЧЧ:ММ</code> — тогда будет сегодняшняя дата.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2208,11 +2229,19 @@ async def blackout_start(message: Message, state: FSMContext, settings: Settings
         return
     parsed = parse_booking_start_text(message.text or "", settings)
     if parsed is None:
-        await message.answer("Не разобрал дату. Пример: <code>04.05.2026 10:00</code>", parse_mode=ParseMode.HTML)
+        parsed = _parse_time_only_to_utc(message.text or "", settings)
+    if parsed is None:
+        await message.answer(
+            "Не разобрал дату. Пример: <code>04.05.2026 10:00</code> или просто <code>10:00</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     await state.update_data(blackout_start_iso=parsed.isoformat())
     await state.set_state(AdminBlackoutStates.waiting_end)
-    await message.answer("Конец окна — тот же формат <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>:", parse_mode=ParseMode.HTML)
+    await message.answer(
+        "Конец окна: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code> или просто <code>ЧЧ:ММ</code>:",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(AdminBlackoutStates.waiting_end, F.text)
@@ -2251,11 +2280,21 @@ async def blackout_end(message: Message, state: FSMContext, bot: Bot, settings: 
             return
         end_parsed = parse_booking_start_text(message.text or "", settings)
         if end_parsed is None:
-            await message.answer("Не разобрал дату конца.", parse_mode=ParseMode.HTML)
+            end_parsed = _parse_time_only_to_utc(message.text or "", settings)
+        if end_parsed is None:
+            await message.answer(
+                "Не разобрал дату конца. Пример: <code>04.05.2026 15:00</code> или просто <code>15:00</code>",
+                parse_mode=ParseMode.HTML,
+            )
             return
         start_at = ensure_utc(datetime.fromisoformat(str(start_iso)))
         end_at = ensure_utc(end_parsed)
-        if start_at is None or end_at is None or end_at <= start_at:
+        if start_at is None or end_at is None:
+            await message.answer("Ошибка разбора дат.")
+            return
+        if end_at <= start_at:
+            end_at += timedelta(days=1)
+        if end_at <= start_at:
             await message.answer("Конец должен быть позже начала.")
             return
 
