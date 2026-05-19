@@ -478,6 +478,63 @@ def _format_daily_recurring_availability_line(
     return f"• ежедневно с <b>{start_s}</b> до <b>{end_s}</b>{suffix}"
 
 
+def _canonical_free_segment_bounds_utc(
+    day: date,
+    blackout_start_minute: int,
+    blackout_end_minute: int,
+    tz: ZoneInfo,
+) -> tuple[datetime, datetime]:
+    """Полный свободный интервал вне ежедневного blackout на календарный день day (локально)."""
+    free_start = blackout_end_minute
+    s_local = datetime(
+        day.year, day.month, day.day, free_start // 60, free_start % 60, tzinfo=tz
+    )
+    if blackout_start_minute < blackout_end_minute:
+        end_day = day + timedelta(days=1)
+        e_local = datetime(
+            end_day.year,
+            end_day.month,
+            end_day.day,
+            blackout_start_minute // 60,
+            blackout_start_minute % 60,
+            tzinfo=tz,
+        )
+    else:
+        e_local = datetime(
+            day.year,
+            day.month,
+            day.day,
+            blackout_start_minute // 60,
+            blackout_start_minute % 60,
+            tzinfo=tz,
+        )
+    return s_local.astimezone(UTC), e_local.astimezone(UTC)
+
+
+def _is_canonical_daily_free_segment(
+    sa: datetime,
+    se: datetime,
+    blackout_start_minute: int,
+    blackout_end_minute: int,
+    settings: Settings,
+) -> bool:
+    """Сегмент = целое ежедневное окно (12:00→03:00), а не урезанное бронью или «сейчас»."""
+    tz = settings.display_tz
+    sa_u, se_u = ensure_utc(sa), ensure_utc(se)
+    if sa_u is None or se_u is None:
+        return False
+    sa_l = sa_u.astimezone(tz)
+    free_start = blackout_end_minute if blackout_start_minute < blackout_end_minute else blackout_end_minute
+    if sa_l.hour * 60 + sa_l.minute != free_start:
+        return False
+    exp_s, exp_e = _canonical_free_segment_bounds_utc(
+        sa_l.date(), blackout_start_minute, blackout_end_minute, tz
+    )
+    if abs((sa_u - exp_s).total_seconds()) > 60:
+        return False
+    return abs((se_u - exp_e).total_seconds()) < 60
+
+
 async def _load_recurring_daily_blackout_minutes(
     session: AsyncSession, item_id: int
 ) -> list[tuple[int, int]]:
@@ -648,22 +705,19 @@ async def format_user_booking_availability_block(
     horizon = now_u + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
 
     recurring_bo = await _load_recurring_daily_blackout_minutes(session, item_id)
-    if len(recurring_bo) == 1:
-        if not await _has_non_recurring_blackout_in_range(session, item_id, now_u, horizon):
-            rr_pre = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
-            rr_in_horizon = [
-                (s, e)
-                for s, e in rr_pre
-                if (su := ensure_utc(s)) is not None
-                and (eu := ensure_utc(e)) is not None
-                and eu > now_u
-                and su < horizon
-            ]
-            if not rr_in_horizon:
-                bo_s, bo_e = recurring_bo[0]
-                fs, fe = _free_booking_display_minutes_from_blackout(bo_s, bo_e)
-                line = _format_daily_recurring_availability_line(fs, fe, settings)
-                return f"<b>Окна, свободные для брони:</b>\n\n{line}"
+    recurring_mode = False
+    recurring_bo_s = 0
+    recurring_bo_e = 0
+    recurring_free_start = 0
+    recurring_free_end = 0
+    if len(recurring_bo) == 1 and not await _has_non_recurring_blackout_in_range(
+        session, item_id, now_u, horizon
+    ):
+        recurring_mode = True
+        recurring_bo_s, recurring_bo_e = recurring_bo[0]
+        recurring_free_start, recurring_free_end = _free_booking_display_minutes_from_blackout(
+            recurring_bo_s, recurring_bo_e
+        )
 
     rr = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
     bo = merge_intervals_utc(
@@ -676,6 +730,20 @@ async def format_user_booking_availability_block(
     )
     cursor = now_u
     lines: list[str] = []
+    if recurring_mode:
+        lines.append(
+            _format_daily_recurring_availability_line(
+                recurring_free_start, recurring_free_end, settings
+            )
+        )
+    exception_lines = 0
+
+    def _skip_canonical_segment(sa: datetime, se: datetime) -> bool:
+        if not recurring_mode:
+            return False
+        return _is_canonical_daily_free_segment(
+            sa, se, recurring_bo_s, recurring_bo_e, settings
+        )
 
     def _right_edge_is_rr_start(se: datetime) -> bool:
         se_u = ensure_utc(se)
@@ -688,8 +756,13 @@ async def format_user_booking_availability_block(
         return False
 
     def add_finite(sa: datetime, se: datetime) -> None:
-        nonlocal lines
-        if len(lines) >= _AVAIL_UI_MAX_LINES:
+        nonlocal lines, exception_lines
+        if _skip_canonical_segment(sa, se):
+            return
+        if recurring_mode:
+            if exception_lines >= _AVAIL_UI_MAX_LINES - 1:
+                return
+        elif len(lines) >= _AVAIL_UI_MAX_LINES:
             return
         sa_u = ensure_utc(sa)
         if sa_u is None:
@@ -707,9 +780,13 @@ async def format_user_booking_availability_block(
         lines.append(
             f"• с <b>{format_local_time(sa_u, settings)}</b> по <b>{format_local_time(latest, settings)}</b>"
         )
+        if recurring_mode:
+            exception_lines += 1
 
     def add_open(sa: datetime) -> None:
         nonlocal lines
+        if recurring_mode:
+            return
         if len(lines) >= _AVAIL_UI_MAX_LINES:
             return
         sa_u = ensure_utc(sa)
@@ -725,15 +802,21 @@ async def format_user_booking_availability_block(
             continue
         if cursor < su:
             for sa, se in free_segments_excluding_blackout(cursor, su, bo):
-                if len(lines) >= _AVAIL_UI_MAX_LINES:
+                if recurring_mode:
+                    if exception_lines >= _AVAIL_UI_MAX_LINES - 1:
+                        break
+                elif len(lines) >= _AVAIL_UI_MAX_LINES:
                     break
                 add_finite(sa, se)
         if cursor < eu:
             cursor = eu
-        if len(lines) >= _AVAIL_UI_MAX_LINES:
+        if recurring_mode:
+            if exception_lines >= _AVAIL_UI_MAX_LINES - 1:
+                break
+        elif len(lines) >= _AVAIL_UI_MAX_LINES:
             break
 
-    if len(lines) < _AVAIL_UI_MAX_LINES:
+    if not recurring_mode and len(lines) < _AVAIL_UI_MAX_LINES:
         for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
             if len(lines) >= _AVAIL_UI_MAX_LINES:
                 break
@@ -750,13 +833,17 @@ async def format_user_booking_availability_block(
             "Выберите другую дату или зайдите позже."
         )
 
-    collapsed = _collapse_uniform_daily_avail_lines(lines, settings)
-    if collapsed is not None:
-        lines = collapsed
+    collapsed = None
+    if not recurring_mode:
+        collapsed = _collapse_uniform_daily_avail_lines(lines, settings)
+        if collapsed is not None:
+            lines = collapsed
 
     tail = ""
-    if len(lines) >= _AVAIL_UI_MAX_LINES and collapsed is None:
+    if not recurring_mode and len(lines) >= _AVAIL_UI_MAX_LINES and collapsed is None:
         tail = "\n\n<i>…показаны первые окна.</i>"
+    elif recurring_mode and exception_lines >= _AVAIL_UI_MAX_LINES - 1:
+        tail = "\n\n<i>…показаны не все дополнительные окна.</i>"
 
     head = "<b>Окна, свободные для брони:</b>\n\n"
     return head + "\n".join(lines) + tail
