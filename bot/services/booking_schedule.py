@@ -446,6 +446,127 @@ _AVAIL_UI_MAX_LINES = 14
 _AVAIL_TAIL_HORIZON_DAYS = 800
 
 
+def _minute_to_hhmm(minute: int) -> str:
+    m = minute % (24 * 60)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _free_booking_display_minutes_from_blackout(
+    blackout_start_minute: int, blackout_end_minute: int
+) -> tuple[int, int]:
+    """Время начала брони и последняя минута «по» (как в add_finite: конец сегмента − 1 мин)."""
+    if blackout_start_minute < blackout_end_minute:
+        free_start = blackout_end_minute
+        free_end_display = blackout_start_minute - 1
+    else:
+        free_start = blackout_end_minute
+        free_end_display = blackout_start_minute - 1
+    if free_end_display < 0:
+        free_end_display += 24 * 60
+    return free_start, free_end_display
+
+
+def _format_daily_recurring_availability_line(
+    free_start_minute: int,
+    free_end_display_minute: int,
+    settings: Settings,
+) -> str:
+    start_s = _minute_to_hhmm(free_start_minute)
+    end_s = _minute_to_hhmm(free_end_display_minute)
+    lab = settings.time_zone_label.strip()
+    suffix = f" {lab}" if lab else ""
+    return f"• ежедневно с <b>{start_s}</b> до <b>{end_s}</b>{suffix}"
+
+
+async def _load_recurring_daily_blackout_minutes(
+    session: AsyncSession, item_id: int
+) -> list[tuple[int, int]]:
+    r = await session.execute(
+        select(
+            AdminBlackoutWindow.recurring_start_minute,
+            AdminBlackoutWindow.recurring_end_minute,
+        )
+        .select_from(BlackoutWindowItem)
+        .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
+        .where(
+            BlackoutWindowItem.item_id == item_id,
+            AdminBlackoutWindow.is_recurring_daily.is_(True),
+        )
+    )
+    out: list[tuple[int, int]] = []
+    for smin, emin in r.all():
+        if _valid_recurring_bounds(smin, emin):
+            out.append((int(smin), int(emin)))
+    return out
+
+
+async def _has_non_recurring_blackout_in_range(
+    session: AsyncSession,
+    item_id: int,
+    range_start: datetime,
+    range_end: datetime,
+) -> bool:
+    rs, re = ensure_utc(range_start), ensure_utc(range_end)
+    if rs is None or re is None:
+        return False
+    r = await session.execute(
+        select(AdminBlackoutWindow.id)
+        .select_from(BlackoutWindowItem)
+        .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
+        .where(
+            BlackoutWindowItem.item_id == item_id,
+            AdminBlackoutWindow.is_recurring_daily.is_(False),
+            AdminBlackoutWindow.start_at < re,
+            AdminBlackoutWindow.end_at > rs,
+        )
+        .limit(1)
+    )
+    if r.scalar_one_or_none() is not None:
+        return True
+    r_leg = await session.execute(
+        select(ItemBlackout.id)
+        .where(
+            ItemBlackout.item_id == item_id,
+            ItemBlackout.window_id.is_(None),
+            ItemBlackout.start_at < re,
+            ItemBlackout.end_at > rs,
+        )
+        .limit(1)
+    )
+    return r_leg.scalar_one_or_none() is not None
+
+
+def _parse_avail_line_clock_times(line: str) -> tuple[str, str] | None:
+    m = re.search(
+        r"с <b>[^<]*?(\d{1,2}:\d{2})[^<]*</b> по <b>[^<]*?(\d{1,2}:\d{2})",
+        line,
+    )
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _collapse_uniform_daily_avail_lines(lines: list[str], settings: Settings) -> list[str] | None:
+    if len(lines) < 2:
+        return None
+    parsed: list[tuple[str, str]] = []
+    for ln in lines:
+        t = _parse_avail_line_clock_times(ln)
+        if t is None:
+            return None
+        parsed.append(t)
+    first = parsed[0]
+    if not all(t == first for t in parsed):
+        return None
+    h1, m1 = (int(x) for x in first[0].split(":"))
+    h2, m2 = (int(x) for x in first[1].split(":"))
+    return [
+        _format_daily_recurring_availability_line(
+            h1 * 60 + m1, h2 * 60 + m2, settings
+        )
+    ]
+
+
 def merge_intervals_utc(
     intervals: list[tuple[datetime, datetime]],
 ) -> list[tuple[datetime, datetime]]:
@@ -525,6 +646,25 @@ async def format_user_booking_availability_block(
     now_u = ensure_utc(now) or datetime.now(UTC)
     lo, hi = rent_lo_hi(item)
     horizon = now_u + timedelta(days=_AVAIL_TAIL_HORIZON_DAYS)
+
+    recurring_bo = await _load_recurring_daily_blackout_minutes(session, item_id)
+    if len(recurring_bo) == 1:
+        if not await _has_non_recurring_blackout_in_range(session, item_id, now_u, horizon):
+            rr_pre = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
+            rr_in_horizon = [
+                (s, e)
+                for s, e in rr_pre
+                if (su := ensure_utc(s)) is not None
+                and (eu := ensure_utc(e)) is not None
+                and eu > now_u
+                and su < horizon
+            ]
+            if not rr_in_horizon:
+                bo_s, bo_e = recurring_bo[0]
+                fs, fe = _free_booking_display_minutes_from_blackout(bo_s, bo_e)
+                line = _format_daily_recurring_availability_line(fs, fe, settings)
+                return f"<b>Окна, свободные для брони:</b>\n\n{line}"
+
     rr = merge_intervals_utc(await load_rr_busy_intervals_utc(session, item_id))
     bo = merge_intervals_utc(
         await load_blackout_intervals_utc(
@@ -610,8 +750,12 @@ async def format_user_booking_availability_block(
             "Выберите другую дату или зайдите позже."
         )
 
+    collapsed = _collapse_uniform_daily_avail_lines(lines, settings)
+    if collapsed is not None:
+        lines = collapsed
+
     tail = ""
-    if len(lines) >= _AVAIL_UI_MAX_LINES:
+    if len(lines) >= _AVAIL_UI_MAX_LINES and collapsed is None:
         tail = "\n\n<i>…показаны первые окна.</i>"
 
     head = "<b>Окна, свободные для брони:</b>\n\n"
