@@ -669,7 +669,9 @@ async def _finalize_rental_handover(
     rental.start_at = now
     rental.end_at = end
     try:
-        total = price_for_hours(item, hours)
+        total = price_for_hours(
+            item, hours, family_discount_percent=rental.family_discount_percent
+        )
     except ValueError:
         total = Decimal("0")
     record_handover_stat(
@@ -772,6 +774,7 @@ async def add_item_back_command(message: Message, state: FSMContext, settings: S
         AddItemStates.price_hour,
         AddItemStates.price_day,
         AddItemStates.price_week,
+        AddItemStates.family_discount_percent,
     ),
     F.text.lower() == "назад",
 )
@@ -851,6 +854,11 @@ async def _add_item_step_back(
         await state.set_data(_omit_fsm_keys(data, "price_day"))
         await state.set_state(AddItemStates.price_hour)
         await message.answer("Введите цену за час (число, например 100):")
+        return
+    if st == AddItemStates.family_discount_percent.state:
+        await state.set_data(_omit_fsm_keys(data, "family_discount_percent"))
+        await state.set_state(AddItemStates.price_week)
+        await message.answer("Цена за неделю (168 часов):")
         return
     if st == AddItemStates.price_week.state:
         await state.set_data(_omit_fsm_keys(data, "price_week"))
@@ -1061,6 +1069,29 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
     except InvalidOperation:
         await message.answer("Нужно число. Повторите цену за неделю:")
         return
+    await state.update_data(price_week=str(v))
+    await state.set_state(AddItemStates.family_discount_percent)
+    await message.answer(
+        "Укажите скидку для семьи Dodger в процентах — целое число от 0 до 90. "
+        "0 — скидки нет."
+    )
+
+
+@router.message(AddItemStates.family_discount_percent, F.text)
+async def add_item_family_discount_percent(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        discount = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введите целое число от 0 до 90.")
+        return
+    if not 0 <= discount <= 90:
+        await message.answer("Скидка должна быть от 0 до 90%.")
+        return
     data = await state.get_data()
     async with db_session.async_session_maker() as session:
         ord_val = await next_display_order_for_group(
@@ -1073,7 +1104,8 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
             is_paid=True,
             price_hour=Decimal(data["price_hour"]),
             price_day=Decimal(data["price_day"]),
-            price_week=v,
+            price_week=Decimal(data["price_week"]),
+            family_discount_percent=discount,
             item_category=data.get("item_category"),
             display_order=ord_val,
             owner_user_id=message.from_user.id,
@@ -1084,7 +1116,9 @@ async def add_item_price_week(message: Message, state: FSMContext, settings: Set
         session.add(item)
         await session.commit()
     await state.clear()
-    await message.answer("Вещь добавлена (платная аренда).")
+    await message.answer(
+        f"Вещь добавлена (платная аренда). Скидка для семьи Dodger: {discount}%."
+    )
 
 
 def _edit_item_cb_filter(query: CallbackQuery) -> bool:

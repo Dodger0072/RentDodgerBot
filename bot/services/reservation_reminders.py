@@ -173,7 +173,9 @@ async def process_reservation_booking_starts(bot: Bot, settings: Settings) -> No
                 continue
 
             try:
-                total = price_for_hours(item, res.requested_hours)
+                total = price_for_hours(
+                    item, res.requested_hours, family_discount_percent=res.family_discount_percent
+                )
             except ValueError:
                 total = Decimal("0")
 
@@ -185,6 +187,7 @@ async def process_reservation_booking_starts(bot: Bot, settings: Settings) -> No
                 start_at=start,
                 end_at=end,
                 requested_hours=res.requested_hours,
+                family_discount_percent=res.family_discount_percent,
             )
             session.add(rental)
             await session.delete(res)

@@ -136,6 +136,15 @@ def confirm_keyboard(action: str, item_id: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def family_discount_keyboard(flow: str, item_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="Да", callback_data=f"family:{flow}:yes:{item_id}"),
+        InlineKeyboardButton(text="Нет", callback_data=f"family:{flow}:no:{item_id}"),
+    )
+    b.row(InlineKeyboardButton(text="« Назад", callback_data="u:nav:back"))
+    return b.as_markup()
+
 def admin_rental_decision_keyboard(rental_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(

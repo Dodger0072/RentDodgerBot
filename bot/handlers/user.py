@@ -28,6 +28,7 @@ from bot.keyboards.inline import (
     category_keyboard_for_admin,
     category_keyboard,
     confirm_keyboard,
+    family_discount_keyboard,
     home_keyboard,
     inventory_subcategory_keyboard,
     item_list_keyboard,
@@ -107,6 +108,10 @@ def _item_caption(item: Item, settings: Settings, extra: str = "") -> str:
         )
     else:
         lines.append("\nБесплатная аренда")
+    if item.is_paid and int(item.family_discount_percent or 0) > 0:
+        lines.append(
+            f"Для семьи Dodger действует скидка {int(item.family_discount_percent)}%."
+        )
     if extra:
         lines.append("\n" + extra)
     return "\n".join(lines)
@@ -518,6 +523,15 @@ async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Setti
     st = await state.get_state()
     data = await state.get_data()
 
+    if st == UserRentStates.waiting_family_discount.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserRentStates.waiting_hours)
+        await state.update_data(hours=None, total=None, family_discount_offer=None)
+        if not await _send_rent_hours_prompt(query.message, item_id, settings, state):
+            await state.clear()
+            await query.message.answer("Вещь недоступна для этой операции.", reply_markup=home_keyboard())
+        await query.answer()
+        return
     if st == UserRentStates.waiting_confirm.state:
         item_id = int(data.get("item_id", 0))
         await state.set_state(UserRentStates.waiting_hours)
@@ -539,6 +553,15 @@ async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Setti
         await query.answer()
         return
 
+    if st == UserBookStates.waiting_family_discount.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserBookStates.waiting_hours)
+        await state.update_data(hours=None, total=None, family_discount_offer=None)
+        if not await _resend_book_hours_prompt(query.message, item_id, settings, state):
+            await state.clear()
+            await query.message.answer("Начните бронь заново.", reply_markup=home_keyboard())
+        await query.answer()
+        return
     if st == UserBookStates.waiting_confirm.state:
         item_id = int(data.get("item_id", 0))
         await state.set_state(UserBookStates.waiting_hours)
@@ -857,6 +880,17 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
             reply_markup=nav_back_keyboard(),
         )
         return
+    offered_discount = int(item.family_discount_percent or 0) if item.is_paid else 0
+    if offered_discount > 0:
+        await state.update_data(hours=h, total=None, family_discount_offer=offered_discount)
+        await state.set_state(UserRentStates.waiting_family_discount)
+        await message.answer(
+            f"Вы состоите в семье Dodger? Для участников действует скидка {offered_discount}%.",
+            reply_markup=family_discount_keyboard("rent", item_id),
+        )
+        return
+    await state.update_data(family_discount_percent=0)
+
     notice = ""
     async with db_session.async_session_maker() as session:
         notice = await near_ban_notice_for_user(session, message.from_user.id)
@@ -878,6 +912,61 @@ async def user_rent_hours(message: Message, state: FSMContext, settings: Setting
         )
 
 
+@router.callback_query(F.data.regexp(r"^family:(rent|book):(yes|no):(\d+)$"))
+async def user_family_discount_answer(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    _, flow, answer, raw_item_id = (query.data or "").split(":")
+    item_id = int(raw_item_id)
+    expected_state = (
+        UserRentStates.waiting_family_discount.state
+        if flow == "rent"
+        else UserBookStates.waiting_family_discount.state
+    )
+    if await state.get_state() != expected_state:
+        await query.answer("Данные устарели", show_alert=True)
+        return
+    data = await state.get_data()
+    if int(data.get("item_id", -1)) != item_id:
+        await query.answer("Данные устарели", show_alert=True)
+        return
+    offered = int(data.get("family_discount_offer", 0))
+    if not 1 <= offered <= 90:
+        await state.clear()
+        await query.answer("Скидка больше не доступна", show_alert=True)
+        return
+    discount = offered if answer == "yes" else 0
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(select(Item).where(Item.id == item_id, Item.is_visible.is_(True)))
+        item = r.scalar_one_or_none()
+    if item is None:
+        await state.clear()
+        await query.answer("Вещь не найдена", show_alert=True)
+        return
+    hours = int(data.get("hours", 0))
+    try:
+        total = price_for_hours(item, hours, family_discount_percent=discount)
+    except ValueError as exc:
+        await query.answer(f"Ошибка расчёта: {exc}", show_alert=True)
+        return
+    await state.update_data(family_discount_percent=discount, total=str(total))
+    if flow == "rent":
+        await state.set_state(UserRentStates.waiting_confirm)
+        prompt = f"Итого за {hours} ч: <b>{format_money(total)}</b>"
+        if discount:
+            prompt += f"\nСкидка для семьи Dodger: {discount}%"
+        prompt += "\nПодтвердить заявку?"
+        markup = confirm_keyboard("rent", item_id)
+    else:
+        await state.set_state(UserBookStates.waiting_confirm)
+        prompt = f"Итого за {hours} ч: <b>{format_money(total)}</b>"
+        if discount:
+            prompt += f"\nСкидка для семьи Dodger: {discount}%"
+        prompt += "\nПодтвердить бронь?" + booking_rules_block()
+        markup = confirm_keyboard("book", item_id)
+    await query.message.answer(prompt, reply_markup=markup, parse_mode=ParseMode.HTML)
+    await query.answer()
+
 @router.callback_query(F.data.regexp(r"^rent:(yes|no):(\d+)$"))
 async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, settings: Settings) -> None:
     parts = query.data.split(":")
@@ -894,6 +983,7 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
         await query.answer("Данные устарели", show_alert=True)
         return
     hours = int(data.get("hours", 0))
+    discount = int(data.get("family_discount_percent", 0))
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
         st = await user_facing_status(session, item_id)
@@ -932,7 +1022,7 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
             )
             await state.clear()
             return
-        total = price_for_hours(item, hours)
+        total = price_for_hours(item, hours, family_discount_percent=discount)
         rental = Rental(
             item_id=item_id,
             user_id=query.from_user.id,
@@ -941,6 +1031,7 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
             start_at=now,
             end_at=planned_end,
             requested_hours=hours,
+            family_discount_percent=discount,
         )
         session.add(rental)
         await session.flush()
@@ -1042,6 +1133,17 @@ async def user_book_hours(message: Message, state: FSMContext, settings: Setting
             reply_markup=nav_back_keyboard(),
         )
         return
+    offered_discount = int(item.family_discount_percent or 0) if item.is_paid else 0
+    if offered_discount > 0:
+        await state.update_data(hours=h, total=None, family_discount_offer=offered_discount)
+        await state.set_state(UserBookStates.waiting_family_discount)
+        await message.answer(
+            f"Вы состоите в семье Dodger? Для участников действует скидка {offered_discount}%.",
+            reply_markup=family_discount_keyboard("book", item_id),
+        )
+        return
+    await state.update_data(family_discount_percent=0)
+
     notice = ""
     async with db_session.async_session_maker() as session:
         notice = await near_ban_notice_for_user(session, message.from_user.id)
@@ -1084,6 +1186,7 @@ async def user_book_confirm(
         await query.answer("Данные устарели", show_alert=True)
         return
     hours = int(data.get("hours", 0))
+    discount = int(data.get("family_discount_percent", 0))
     start_iso = data.get("book_start_iso")
     if not start_iso:
         await state.clear()
@@ -1129,12 +1232,13 @@ async def user_book_confirm(
             start_at=start_at,
             end_at=end_at,
             requested_hours=hours,
+            family_discount_percent=discount,
             created_at=now,
         )
         session.add(res)
         await session.flush()
         try:
-            total = price_for_hours(item, hours)
+            total = price_for_hours(item, hours, family_discount_percent=discount)
         except ValueError:
             total = Decimal("0")
         await notify_admins_new_reservation(bot, settings, item, res, total)

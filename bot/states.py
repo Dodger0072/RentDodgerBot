@@ -12,6 +12,7 @@ class AddItemStates(StatesGroup):
     price_hour = State()
     price_day = State()
     price_week = State()
+    family_discount_percent = State()
 
 
 class EditItemStates(StatesGroup):
@@ -29,12 +30,14 @@ class EditItemStates(StatesGroup):
 
 class UserRentStates(StatesGroup):
     waiting_hours = State()
+    waiting_family_discount = State()
     waiting_confirm = State()
 
 
 class UserBookStates(StatesGroup):
     waiting_start_datetime = State()
     waiting_hours = State()
+    waiting_family_discount = State()
     waiting_confirm = State()
 
 

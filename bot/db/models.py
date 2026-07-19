@@ -59,6 +59,7 @@ class Item(Base):
     price_hour = mapped_column(Numeric(12, 2), nullable=True)
     price_day = mapped_column(Numeric(12, 2), nullable=True)
     price_week = mapped_column(Numeric(12, 2), nullable=True)
+    family_discount_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_paid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     owner_user_id = mapped_column(BigInteger, nullable=True)
@@ -245,6 +246,7 @@ class Rental(Base):
     start_at = mapped_column(DateTime(timezone=True), nullable=True)
     end_at = mapped_column(DateTime(timezone=True), nullable=True)
     requested_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    family_discount_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     admin_message_chat_id = mapped_column(BigInteger, nullable=True)
     admin_message_id = mapped_column(BigInteger, nullable=True)
     no_response_penalty_applied: Mapped[bool] = mapped_column(
@@ -264,6 +266,7 @@ class Reservation(Base):
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     requested_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    family_discount_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notified_before_1h: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notified_before_15m: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

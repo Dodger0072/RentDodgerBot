@@ -167,6 +167,20 @@ async def _migrate_sqlite_item_rent_hours(conn) -> None:
         await conn.execute(text("ALTER TABLE items ADD COLUMN rent_hours_max INTEGER"))
 
 
+async def _migrate_sqlite_family_discount(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    for table in ("items", "rentals", "reservations"):
+        r = await conn.execute(text(f"PRAGMA table_info({table})"))
+        cols = {row[1] for row in r.fetchall()}
+        if "family_discount_percent" not in cols:
+            await conn.execute(
+                text(
+                    f"ALTER TABLE {table} ADD COLUMN family_discount_percent "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+
 async def _migrate_sqlite_rental_handover_stat_actor(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -211,6 +225,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_display_order(conn)
         await _migrate_sqlite_item_visibility(conn)
         await _migrate_sqlite_item_rent_hours(conn)
+        await _migrate_sqlite_family_discount(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
         await _migrate_sqlite_item_blackout_window(conn)
         await _migrate_sqlite_item_blackout_subscription_cols(conn)

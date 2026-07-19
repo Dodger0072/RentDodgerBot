@@ -76,7 +76,9 @@ def format_money(value: Decimal) -> str:
     return f"{_int_grouped_dots(n)}$"
 
 
-def price_for_hours(item: Item, hours: int) -> Decimal:
+def price_for_hours(
+    item: Item, hours: int, *, family_discount_percent: int = 0
+) -> Decimal:
     lo, hi = rent_hours_bounds(item)
     if hours < lo or hours > hi:
         kind = "Платная" if item.is_paid else "Бесплатная"
@@ -88,12 +90,16 @@ def price_for_hours(item: Item, hours: int) -> Decimal:
         raise ValueError("paid item missing prices")
 
     if hours == 168:
-        return Decimal(pw)
-    if 1 <= hours <= 23:
-        return Decimal(ph) * hours
-    if 24 <= hours <= 167:
-        return (Decimal(hours) / Decimal(24)) * Decimal(pd)
-    raise ValueError("invalid hours")
+        total = Decimal(pw)
+    elif 1 <= hours <= 23:
+        total = Decimal(ph) * hours
+    elif 24 <= hours <= 167:
+        total = (Decimal(hours) / Decimal(24)) * Decimal(pd)
+    else:
+        raise ValueError("invalid hours")
+    if not 0 <= int(family_discount_percent) <= 90:
+        raise ValueError("family discount must be from 0 to 90")
+    return total * (Decimal(100) - Decimal(int(family_discount_percent))) / Decimal(100)
 
 
 @dataclass
