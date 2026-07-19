@@ -38,6 +38,7 @@ from bot.db import session as db_session
 from bot.keyboards.inline import (
     admin_panel_keyboard,
     admin_hours_keyboard,
+    admin_family_discount_keyboard,
     admin_item_category_keyboard,
     admin_rental_decision_keyboard,
     category_keyboard_for_admin,
@@ -3782,6 +3783,27 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
     )
 
 
+async def _start_handover_hours_selection(
+    query: CallbackQuery, state: FSMContext, *, rental_id: int, lo: int, hi: int
+) -> None:
+    base = query.message.html_text or query.message.text or ""
+    hint = (
+        f"\n\n<i>Выберите срок сдачи кнопкой или отправьте число часов "
+        f"(от {lo} до {hi}) обычным сообщением в чат.</i>"
+    )
+    await query.message.edit_text(
+        base + hint,
+        reply_markup=admin_hours_keyboard(rental_id, lo, hi),
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AdminRentalStates.waiting_handover_hours)
+    await state.update_data(
+        pending_rental_id=rental_id,
+        handover_chat_id=query.message.chat.id,
+        handover_message_id=query.message.message_id,
+    )
+
+
 @router.callback_query(F.data.regexp(r"^adm:r:(\d+):ok$"))
 async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     if not _admin_only(settings, query.from_user.id, query.from_user.username):
@@ -3800,22 +3822,53 @@ async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Set
             await _safe_query_answer(query, "Это не ваша вещь.", show_alert=True)
             return
         lo, hi = rent_hours_bounds(rental.item)
-    base = query.message.html_text or query.message.text or ""
-    hint = (
-        f"\n\n<i>Выберите срок сдачи кнопкой или отправьте число часов "
-        f"(от {lo} до {hi}) обычным сообщением в чат.</i>"
-    )
-    await query.message.edit_text(
-        base + hint,
-        reply_markup=admin_hours_keyboard(rid, lo, hi),
-        parse_mode=ParseMode.HTML,
-    )
-    await state.set_state(AdminRentalStates.waiting_handover_hours)
-    await state.update_data(
-        pending_rental_id=rid,
-        handover_chat_id=query.message.chat.id,
-        handover_message_id=query.message.message_id,
-    )
+        discount = int(rental.family_discount_percent or 0)
+    if discount > 0:
+        base = query.message.html_text or query.message.text or ""
+        await query.message.edit_text(
+            base
+            + f"\n\n<b>В заявке применена скидка семьи Dodger: {discount}%.</b>\n"
+            "Подтвердите, состоит ли арендатор в семье:",
+            reply_markup=admin_family_discount_keyboard(rid, discount),
+            parse_mode=ParseMode.HTML,
+        )
+        await state.set_state(AdminRentalStates.waiting_family_discount)
+        await state.update_data(
+            pending_rental_id=rid,
+            handover_chat_id=query.message.chat.id,
+            handover_message_id=query.message.message_id,
+        )
+        await _safe_query_answer(query)
+        return
+    await _start_handover_hours_selection(query, state, rental_id=rid, lo=lo, hi=hi)
+    await _safe_query_answer(query)
+
+
+@router.callback_query(F.data.regexp(r"^adm:r:(\d+):family:(yes|no)$"))
+async def admin_rental_family_discount_decision(
+    query: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    _, _, raw_rid, _, answer = (query.data or "").split(":")
+    rid = int(raw_rid)
+    async with db_session.async_session_maker() as session:
+        r = await session.execute(
+            select(Rental).options(selectinload(Rental.item)).where(Rental.id == rid)
+        )
+        rental = r.scalar_one_or_none()
+        if rental is None or rental.state != RentalState.pending_admin.value:
+            await _safe_query_answer(query, "Заявка не найдена или уже обработана", show_alert=True)
+            return
+        if not admin_manages_item(query.from_user.id, rental.item):
+            await _safe_query_answer(query, "Это не ваша вещь.", show_alert=True)
+            return
+        if int(rental.family_discount_percent or 0) <= 0:
+            await _safe_query_answer(query, "В этой заявке скидка не применялась", show_alert=True)
+            return
+        if answer == "no":
+            rental.family_discount_percent = 0
+            await session.commit()
+        lo, hi = rent_hours_bounds(rental.item)
+    await _start_handover_hours_selection(query, state, rental_id=rid, lo=lo, hi=hi)
     await _safe_query_answer(query)
 
 

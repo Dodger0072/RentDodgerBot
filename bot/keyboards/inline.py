@@ -160,6 +160,21 @@ def admin_rental_decision_keyboard(rental_id: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def admin_family_discount_keyboard(rental_id: int, discount_percent: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text=f"Да, скидка {discount_percent}%",
+            callback_data=f"adm:r:{rental_id}:family:yes",
+        ),
+        InlineKeyboardButton(
+            text="Нет, не состоит",
+            callback_data=f"adm:r:{rental_id}:family:no",
+        ),
+    )
+    b.row(InlineKeyboardButton(text="Отмена", callback_data=f"adm:r:{rental_id}:cancel"))
+    return b.as_markup()
+
 def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMarkup:
     preset = [1, 3, 6, 12, 24, 48, 72, 168]
     hours = [h for h in preset if lo <= h <= hi]

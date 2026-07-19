@@ -49,6 +49,7 @@ class AdminRentalStates(StatesGroup):
     """«Вещь сдана» — ждём срок; «не сдана» — опционально текст причины для пользователя."""
 
     waiting_handover_hours = State()
+    waiting_family_discount = State()
     waiting_no_handover_reason = State()
 
 
