@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from uuid import uuid4
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
@@ -40,6 +41,7 @@ from bot.keyboards.inline import (
     admin_hours_keyboard,
     admin_family_discount_keyboard,
     admin_item_category_keyboard,
+    add_item_rental_kind_keyboard,
     admin_rental_decision_keyboard,
     category_keyboard_for_admin,
     edit_item_category_keyboard,
@@ -115,6 +117,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 router = Router(name="admin")
+
+_ADD_KIND_PROMPT = "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u0430\u0440\u0435\u043d\u0434\u044b:"
+_ADD_KIND_BUTTON_REQUIRED = "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043d\u043e\u043f\u043a\u043e\u0439 \u043d\u0438\u0436\u0435."
 
 
 class _PanelMessageProxy:
@@ -822,11 +827,9 @@ async def _add_item_step_back(
         )
         return
     if st == AddItemStates.rent_hours_min.state:
-        await state.set_data(_omit_fsm_keys(data, "rent_hours_min"))
+        await state.set_data(_omit_fsm_keys(data, "rent_hours_min", "is_paid", "rental_kind"))
         await state.set_state(AddItemStates.is_paid)
-        await message.answer(
-            "Категория: платная или бесплатная аренда? Ответьте словом «платная» или «бесплатная»."
-        )
+        await message.answer(_ADD_KIND_PROMPT, reply_markup=add_item_rental_kind_keyboard())
         return
     if st == AddItemStates.rent_hours_max.state:
         await state.set_data(_omit_fsm_keys(data, "rent_hours_min"))
@@ -918,8 +921,7 @@ async def add_item_photos_done(message: Message, state: FSMContext, settings: Se
         await state.clear()
         return
     await state.set_state(AddItemStates.is_paid)
-    await message.answer("Категория: платная или бесплатная аренда? Ответьте словом «платная» или «бесплатная».")
-
+    await message.answer(_ADD_KIND_PROMPT, reply_markup=add_item_rental_kind_keyboard())
 
 @router.message(AddItemStates.photos, F.photo)
 async def add_item_photo_collect(message: Message, state: FSMContext, settings: Settings) -> None:
@@ -934,28 +936,30 @@ async def add_item_photo_collect(message: Message, state: FSMContext, settings: 
     await message.answer("Фото добавлено. Ещё фото или /done")
 
 
+@router.callback_query(StateFilter(AddItemStates.is_paid), F.data.regexp(r"^adm:addkind:(paid|free|both)$"))
+async def add_item_rental_kind_cb(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not _admin_only(settings, query.from_user.id, query.from_user.username):
+        await query.answer("\u041d\u0435\u0442 \u0434\u043e\u0441\u0442\u0443\u043f\u0430", show_alert=True)
+        await state.clear()
+        return
+    kind = (query.data or "").rsplit(":", 1)[-1]
+    if kind not in {"paid", "free", "both"}:
+        await query.answer("\u041d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u044b\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442", show_alert=True)
+        return
+    await state.update_data(rental_kind=kind, is_paid=(kind != "free"))
+    await state.set_state(AddItemStates.rent_hours_min)
+    await query.message.edit_text(
+        "\u041c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u0441\u0440\u043e\u043a \u0430\u0440\u0435\u043d\u0434\u044b \u0432 \u0447\u0430\u0441\u0430\u0445 (\u0446\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 168):"
+    )
+    await query.answer()
+
+
 @router.message(AddItemStates.is_paid, F.text)
-async def add_item_is_paid(message: Message, state: FSMContext, settings: Settings) -> None:
+async def add_item_rental_kind_text(message: Message, state: FSMContext, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         await state.clear()
         return
-    t = message.text.strip().lower()
-    if "бесплат" in t:
-        await state.update_data(is_paid=False)
-        await state.set_state(AddItemStates.rent_hours_min)
-        await message.answer(
-            "Минимальный срок аренды в часах (целое число от 1 до 168):"
-        )
-        return
-    if "плат" in t:
-        await state.update_data(is_paid=True)
-        await state.set_state(AddItemStates.rent_hours_min)
-        await message.answer(
-            "Минимальный срок аренды в часах (целое число от 1 до 168):"
-        )
-        return
-    await message.answer("Напишите «платная» или «бесплатная».")
-
+    await message.answer(_ADD_KIND_BUTTON_REQUIRED, reply_markup=add_item_rental_kind_keyboard())
 
 @router.message(AddItemStates.rent_hours_min, F.text)
 async def add_item_rent_hours_min(
@@ -1000,7 +1004,7 @@ async def add_item_rent_hours_max(
     if m < n or m > MAX_RENT_HOURS:
         await message.answer(f"Допустимо от {n} до {MAX_RENT_HOURS} ч.")
         return
-    if data.get("is_paid"):
+    if data.get("rental_kind") in {"paid", "both"}:
         await state.update_data(rent_hours_max=m)
         await state.set_state(AddItemStates.price_hour)
         await message.answer("Введите цену за час (число, например 100):")
@@ -1088,17 +1092,19 @@ async def add_item_family_discount_percent(
     try:
         discount = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Введите целое число от 0 до 90.")
+        await message.answer("\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0446\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 0 \u0434\u043e 90.")
         return
     if not 0 <= discount <= 90:
-        await message.answer("Скидка должна быть от 0 до 90%.")
+        await message.answer("\u0421\u043a\u0438\u0434\u043a\u0430 \u0434\u043e\u043b\u0436\u043d\u0430 \u0431\u044b\u0442\u044c \u043e\u0442 0 \u0434\u043e 90%.")
         return
     data = await state.get_data()
+    is_both = data.get("rental_kind") == "both"
+    group_id = str(uuid4()) if is_both else None
     async with db_session.async_session_maker() as session:
-        ord_val = await next_display_order_for_group(
+        paid_order = await next_display_order_for_group(
             session, is_paid=True, item_category=data.get("item_category")
         )
-        item = Item(
+        paid_item = Item(
             name=data["name"],
             description=data["description"],
             photos_json=json.dumps(data.get("photos") or [], ensure_ascii=False),
@@ -1108,19 +1114,42 @@ async def add_item_family_discount_percent(
             price_week=Decimal(data["price_week"]),
             family_discount_percent=discount,
             item_category=data.get("item_category"),
-            display_order=ord_val,
+            display_order=paid_order,
             owner_user_id=message.from_user.id,
             owner_username=message.from_user.username,
             rent_hours_min=int(data["rent_hours_min"]),
             rent_hours_max=int(data["rent_hours_max"]),
+            rental_group_id=group_id,
         )
-        session.add(item)
+        session.add(paid_item)
+        if is_both:
+            free_order = await next_display_order_for_group(
+                session, is_paid=False, item_category=data.get("item_category")
+            )
+            session.add(
+                Item(
+                    name=data["name"],
+                    description=data["description"],
+                    photos_json=json.dumps(data.get("photos") or [], ensure_ascii=False),
+                    is_paid=False,
+                    price_hour=None,
+                    price_day=None,
+                    price_week=None,
+                    item_category=data.get("item_category"),
+                    display_order=free_order,
+                    owner_user_id=message.from_user.id,
+                    owner_username=message.from_user.username,
+                    rent_hours_min=int(data["rent_hours_min"]),
+                    rent_hours_max=int(data["rent_hours_max"]),
+                    rental_group_id=group_id,
+                )
+            )
         await session.commit()
     await state.clear()
-    await message.answer(
-        f"Вещь добавлена (платная аренда). Скидка для семьи Dodger: {discount}%."
-    )
-
+    result = "\u0412\u0435\u0449\u044c \u0434\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u0430 \u0432 \u043f\u043b\u0430\u0442\u043d\u0443\u044e \u0430\u0440\u0435\u043d\u0434\u0443."
+    if is_both:
+        result = "\u0412\u0435\u0449\u044c \u0434\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u0430 \u0432 \u043e\u0431\u0430 \u043a\u0430\u0442\u0430\u043b\u043e\u0433\u0430; \u0437\u0430\u043d\u044f\u0442\u043e\u0441\u0442\u044c \u0443 \u043a\u0430\u0440\u0442\u043e\u0447\u0435\u043a \u043e\u0431\u0449\u0430\u044f."
+    await message.answer(result)
 
 def _edit_item_cb_filter(query: CallbackQuery) -> bool:
     d = query.data or ""

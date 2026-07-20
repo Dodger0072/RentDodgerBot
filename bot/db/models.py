@@ -61,6 +61,8 @@ class Item(Base):
     price_week = mapped_column(Numeric(12, 2), nullable=True)
     family_discount_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_paid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Shared id for paid/free cards of one physical item.
+    rental_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     owner_user_id = mapped_column(BigInteger, nullable=True)
     owner_username = mapped_column(String(255), nullable=True)

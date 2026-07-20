@@ -191,3 +191,11 @@ def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMark
         b.row(*row)
     b.row(InlineKeyboardButton(text="Отмена", callback_data=f"adm:r:{rental_id}:cancel"))
     return b.as_markup()
+
+def add_item_rental_kind_keyboard() -> InlineKeyboardMarkup:
+    """Choose one or both rental catalogs while adding an item."""
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="\u041f\u043b\u0430\u0442\u043d\u0430\u044f \u0430\u0440\u0435\u043d\u0434\u0430", callback_data="adm:addkind:paid"))
+    b.row(InlineKeyboardButton(text="\u0411\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u0430\u044f \u0430\u0440\u0435\u043d\u0434\u0430", callback_data="adm:addkind:free"))
+    b.row(InlineKeyboardButton(text="\u041f\u043b\u0430\u0442\u043d\u0430\u044f \u0438 \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u0430\u044f", callback_data="adm:addkind:both"))
+    return b.as_markup()

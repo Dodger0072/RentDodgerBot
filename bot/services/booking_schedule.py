@@ -53,12 +53,23 @@ def point_inside_busy(t: datetime, busy: list[tuple[datetime, datetime]]) -> boo
     return any(s <= t < e for s, e in busy)
 
 
+async def linked_item_ids(session: AsyncSession, item_id: int) -> list[int]:
+    """IDs of catalog cards for the same physical item."""
+    item = await session.scalar(select(Item).where(Item.id == item_id))
+    if item is None or not item.rental_group_id:
+        return [int(item_id)]
+    rows = await session.scalars(
+        select(Item.id).where(Item.rental_group_id == item.rental_group_id)
+    )
+    return [int(value) for value in rows.all()]
+
 async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> list[tuple[datetime, datetime]]:
     """Брони и аренды (active / pending_admin): вещь занята по расписанию. Окна «не у компа» (blackout) не включаются."""
+    item_ids = await linked_item_ids(session, item_id)
     busy: list[tuple[datetime, datetime]] = []
 
     r_res = await session.execute(
-        select(Reservation).where(Reservation.item_id == item_id).order_by(Reservation.start_at)
+        select(Reservation).where(Reservation.item_id.in_(item_ids)).order_by(Reservation.start_at)
     )
     for res in r_res.scalars():
         s, e = ensure_utc(res.start_at), ensure_utc(res.end_at)
@@ -67,7 +78,7 @@ async def load_rr_busy_intervals_utc(session: AsyncSession, item_id: int) -> lis
 
     r_rent = await session.execute(
         select(Rental).where(
-            Rental.item_id == item_id,
+            Rental.item_id.in_(item_ids),
             func.coalesce(func.trim(Rental.state), "").in_(
                 (RentalState.active.value, RentalState.pending_admin.value)
             ),
@@ -866,9 +877,10 @@ async def validate_new_reservation(
     past_err = reservation_start_in_past_error(s, now_u)
     if past_err is not None:
         return past_err
+    item_ids = await linked_item_ids(session, item_id)
     r_pend = await session.execute(
         select(Rental.id).where(
-            Rental.item_id == item_id,
+            Rental.item_id.in_(item_ids),
             func.coalesce(func.trim(Rental.state), "") == RentalState.pending_admin.value,
         )
     )

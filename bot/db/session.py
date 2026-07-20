@@ -89,6 +89,14 @@ async def _migrate_sqlite_item_visibility(conn) -> None:
         )
 
 
+async def _migrate_sqlite_item_rental_group(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(items)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "rental_group_id" not in cols:
+        await conn.execute(text("ALTER TABLE items ADD COLUMN rental_group_id VARCHAR(36)"))
+
 async def _migrate_sqlite_rental_no_response_penalty(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -224,6 +232,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_category(conn)
         await _migrate_sqlite_item_display_order(conn)
         await _migrate_sqlite_item_visibility(conn)
+        await _migrate_sqlite_item_rental_group(conn)
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_family_discount(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)

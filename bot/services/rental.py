@@ -217,85 +217,15 @@ def can_take_immediate_rent(st: ItemStatus, ref_now: datetime) -> bool:
 async def items_availability_batch(
     session: AsyncSession, item_ids: list[int]
 ) -> tuple[datetime, dict[int, ItemStatus]]:
+    """Statuses for catalog lists, including linked paid/free cards."""
     await expire_expired_rentals(session)
     ref_now = datetime.now(UTC)
     out: dict[int, ItemStatus] = {}
-    if not item_ids:
-        return ref_now, out
-
-    r_rent = await session.execute(select(Rental).where(Rental.item_id.in_(item_ids)))
-    rentals_by: dict[int, list[Rental]] = defaultdict(list)
-    for row in r_rent.scalars():
-        rentals_by[row.item_id].append(row)
-
-    r_res = await session.execute(
-        select(Reservation)
-        .where(Reservation.item_id.in_(item_ids))
-        .order_by(Reservation.start_at)
-    )
-    res_by: dict[int, list[Reservation]] = defaultdict(list)
-    for row in r_res.scalars():
-        res_by[row.item_id].append(row)
-
-    from bot.services.booking_schedule import (
-        load_blackout_intervals_for_item_ids,
-        load_rr_busy_intervals_utc,
-        next_busy_start_after,
-    )
-
-    bo_by = await load_blackout_intervals_for_item_ids(session, item_ids)
-
-    r_items = await session.execute(select(Item).where(Item.id.in_(item_ids)))
-    items_map: dict[int, Item] = {it.id: it for it in r_items.scalars().all()}
-
-    for iid in item_ids:
-        item = items_map[iid]
-        rentals = rentals_by.get(iid, [])
-        reservations = res_by.get(iid, [])
-        pending = any(
-            _rental_state_norm(r.state) == RentalState.pending_admin.value for r in rentals
-        )
-        active = None
-        for r in rentals:
-            if _rental_state_norm(r.state) != RentalState.active.value:
-                continue
-            end_at = ensure_utc(r.end_at)
-            if end_at is None or end_at <= ref_now:
-                continue
-            active = r
-            break
-        res_cov = reservation_covering_now(reservations, ref_now)
-        in_rs = res_cov is not None
-        res_end = ensure_utc(res_cov.end_at) if res_cov is not None else None
-
-        bo_list = bo_by.get(iid, [])
-        bu = blackout_max_end_covering_now_intervals(bo_list, ref_now)
-        in_bo = bu is not None
-
-        busy = await load_rr_busy_intervals_utc(session, iid)
-        busy_eff = _busy_intervals_still_relevant(ref_now, busy)
-        nxt_after = next_busy_start_after(ref_now, busy_eff) if busy_eff else None
-        lo, hi = rent_hours_bounds(item)
-        if pending or in_bo or active is not None or in_rs:
-            imm = 0
-        else:
-            imm = _compute_immediate_rent_cap_hours(ref_now, busy_eff, lo, hi)
-
-        nxt = next_booking_start_utc(ref_now, active, reservations)
-        out[iid] = ItemStatus(
-            pending_admin=pending,
-            active_rental=active,
-            next_booking_start=nxt,
-            min_rent_hours=lo,
-            immediate_rent_max_hours=imm,
-            in_reserved_slot=in_rs,
-            reserved_until=res_end,
-            next_busy_after=nxt_after,
-            in_blackout=in_bo,
-            blackout_until=bu,
-        )
+    for item_id in dict.fromkeys(int(value) for value in item_ids):
+        status = await user_facing_status(session, item_id)
+        if status is not None:
+            out[item_id] = status
     return ref_now, out
-
 
 async def expire_expired_rentals(session: AsyncSession, now: datetime | None = None) -> None:
     now = ensure_utc(now) or datetime.now(UTC)
@@ -320,15 +250,19 @@ async def _load_item_rentals_reservations(session: AsyncSession, item_id: int) -
     if item is None:
         return None, [], []
 
-    r_rent = await session.execute(select(Rental).where(Rental.item_id == item_id))
+    from bot.services.booking_schedule import linked_item_ids
+
+    item_ids = await linked_item_ids(session, item_id)
+    r_rent = await session.execute(select(Rental).where(Rental.item_id.in_(item_ids)))
     rentals = list(r_rent.scalars().all())
 
     r_res = await session.execute(
-        select(Reservation).where(Reservation.item_id == item_id).order_by(Reservation.start_at)
+        select(Reservation)
+        .where(Reservation.item_id.in_(item_ids))
+        .order_by(Reservation.start_at)
     )
     reservations = list(r_res.scalars().all())
     return item, rentals, reservations
-
 
 def next_booking_start_utc(
     now: datetime,
