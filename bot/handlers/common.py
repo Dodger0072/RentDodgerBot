@@ -8,7 +8,6 @@ from aiogram.types import Message
 
 from bot.config import Settings, is_admin, is_superadmin, superadmin_roles_enabled
 from bot.db import session as db_session
-from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.services.user_bot_state import user_main_menu_seen
 from bot.keyboards.inline import home_keyboard
 from bot.keyboards.reply import remove_reply_keyboard, start_reply_keyboard
@@ -138,7 +137,7 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
     else:
         await message.answer(
             "Доступные действия: /start или кнопка «Начать», затем каталог аренды. "
-            f"/my_bookings — ваши брони; отмена не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.",
+            "/my_bookings — ваши брони; отмена возможна до начала.",
             reply_markup=home_keyboard(),
         )
     if menu_seen:

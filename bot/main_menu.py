@@ -6,7 +6,6 @@ from aiogram.types import Message
 
 from bot.config import Settings, is_admin
 from bot.db import session as db_session
-from bot.services.booking_schedule import MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START
 from bot.services.user_bot_state import mark_main_menu_seen, user_main_menu_seen
 from bot.keyboards.inline import category_keyboard_for_admin
 from bot.keyboards.reply import remove_reply_keyboard
@@ -42,7 +41,7 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
         parse_mode=ParseMode.HTML,
     )
     footer = (
-        f"/my_bookings — список ваших броней и отмена (не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала слота).\n\n"
+        "/my_bookings — список ваших броней и отмена до начала слота.\n\n"
         "Вернуться в этот каталог: команда /start."
     )
     await message.answer(footer, reply_markup=remove_reply_keyboard())

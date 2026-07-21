@@ -52,7 +52,6 @@ from bot.services.booking_schedule import (
     reservation_fits,
     reservation_start_in_past_error,
     validate_new_reservation,
-    MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START,
     user_may_cancel_reservation,
 )
 from bot.services.item_order import non_empty_rental_category_menu_rows
@@ -1257,8 +1256,7 @@ async def user_book_confirm(
     await query.message.edit_text(
         f"Бронь создана с {_fmt_utc_local(start_at, settings)} по {_fmt_utc_local(end_at, settings)}.\n\n"
         f"<i>Свяжитесь с арендодателем вовремя — см. правила предупреждений выше.</i>\n\n"
-        f"/my_bookings — посмотреть или отменить бронь (не позднее чем за "
-        f"{MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала).",
+        "/my_bookings — посмотреть или отменить бронь до её начала.",
         reply_markup=home_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -1282,16 +1280,14 @@ async def cmd_my_bookings(message: Message, settings: Settings) -> None:
         await session.commit()
     if not rows:
         await message.answer(
-            "У вас нет активных броней на будущее.\n\n"
-            f"Свою бронь можно отменить самостоятельно не позднее чем за "
-            f"<b>{MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START}</b> ч до начала — команда /my_bookings.",
+            "У вас нет активных броней на будущее.",
             reply_markup=home_keyboard(),
             parse_mode=ParseMode.HTML,
         )
         return
     lines = [
         "<b>Ваши брони</b>\n",
-        f"<i>Снять бронь самому — не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.</i>\n",
+        "<i>Снять бронь самому можно в любой момент до её начала.</i>\n",
     ]
     for res in rows:
         it = res.item
@@ -1332,7 +1328,7 @@ async def user_cancel_reservation_cb(query: CallbackQuery, bot: Bot, settings: S
         if not user_may_cancel_reservation(now_utc=now, reservation_start_utc=res.start_at):
             await session.rollback()
             await query.answer(
-                f"Отмена возможна не позднее чем за {MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START} ч до начала.",
+                "Бронь уже началась и недоступна для отмены.",
                 show_alert=True,
             )
             return

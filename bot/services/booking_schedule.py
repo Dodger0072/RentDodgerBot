@@ -16,19 +16,17 @@ from bot.time_format import format_local_time
 
 # Интервалы занятости: [start, end) — правая граница не входит (можно стыковать 15:00 ↔15:00).
 
-MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START = 1
 _RECURRING_DEFAULT_PAST_DAYS = 1
 _RECURRING_DEFAULT_FUTURE_DAYS = 45
 
 
 def user_may_cancel_reservation(*, now_utc: datetime, reservation_start_utc: datetime) -> bool:
-    """Своя отмена брони: не позднее чем за час до начала слота (включительно ровно за час)."""
+    """Свою бронь можно отменить в любой момент до начала слота."""
     start = ensure_utc(reservation_start_utc)
     now_u = ensure_utc(now_utc)
     if start is None or now_u is None:
         return False
-    deadline = start - timedelta(hours=MIN_HOURS_USER_CANCEL_RESERVATION_BEFORE_START)
-    return now_u <= deadline
+    return now_u < start
 
 
 def normalize_interval_bounds(start: datetime, end: datetime) -> tuple[datetime, datetime]:
