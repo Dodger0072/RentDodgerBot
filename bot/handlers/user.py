@@ -353,8 +353,18 @@ async def _send_booking_start_prompt(
     avail_html = ""
     async with db_session.async_session_maker() as session:
         notice = await near_ban_notice_for_user(session, message.from_user.id)
+        known_busy_until = (
+            st.active_rental.end_at
+            if st.active_rental is not None
+            else st.reserved_until
+        )
         avail_html = await format_user_booking_availability_block(
-            session, item_id, book_item, settings, now=datetime.now(UTC)
+            session,
+            item_id,
+            book_item,
+            settings,
+            now=datetime.now(UTC),
+            known_busy_until=known_busy_until,
         )
         await session.commit()
     lines = [

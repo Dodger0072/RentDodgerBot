@@ -709,6 +709,7 @@ async def format_user_booking_availability_block(
     settings: Settings,
     *,
     now: datetime | None = None,
+    known_busy_until: datetime | None = None,
 ) -> str:
     """HTML: краткий список окон, где можно указать начало брони."""
     now_u = ensure_utc(now) or datetime.now(UTC)
@@ -829,11 +830,15 @@ async def format_user_booking_availability_block(
         elif len(lines) >= _AVAIL_UI_MAX_LINES:
             break
 
-    if recurring_mode and ended_busy_slot and exception_lines < _AVAIL_UI_MAX_LINES - 1:
+    known_tail_start = ensure_utc(known_busy_until)
+    if known_tail_start is not None and known_tail_start <= now_u:
+        known_tail_start = None
+    tail_start = known_tail_start or (cursor if ended_busy_slot else None)
+    if recurring_mode and tail_start is not None and exception_lines < _AVAIL_UI_MAX_LINES - 1:
         # Общая строка ежедневного окна не показывает, что его текущая часть
         # начинается только после окончания занятого слота. Добавляем один
         # конкретный остаток окна после последней брони/аренды.
-        for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
+        for sa, se in free_segments_excluding_blackout(tail_start, horizon, bo):
             add_finite(sa, se)
             break
 
