@@ -768,6 +768,16 @@ async def format_user_booking_availability_block(
                 return True
         return False
 
+    def _next_rr_start_at_or_after(t: datetime) -> datetime | None:
+        t_u = ensure_utc(t)
+        if t_u is None:
+            return None
+        for bs, _ in rr:
+            bs_u = ensure_utc(bs)
+            if bs_u is not None and bs_u >= t_u:
+                return bs_u
+        return None
+
     def add_finite(sa: datetime, se: datetime) -> None:
         nonlocal lines, exception_lines
         if _skip_canonical_segment(sa, se):
@@ -837,8 +847,12 @@ async def format_user_booking_availability_block(
     if recurring_mode and tail_start is not None and exception_lines < _AVAIL_UI_MAX_LINES - 1:
         # Общая строка ежедневного окна не показывает, что его текущая часть
         # начинается только после окончания занятого слота. Добавляем один
-        # конкретный остаток окна после последней брони/аренды.
+        # конкретный остаток окна после последней брони/аренды. Его нельзя
+        # показывать дальше следующей брони/аренды.
         for sa, se in free_segments_excluding_blackout(tail_start, horizon, bo):
+            next_rr_start = _next_rr_start_at_or_after(sa)
+            if next_rr_start is not None and next_rr_start < se:
+                se = next_rr_start
             add_finite(sa, se)
             break
 
