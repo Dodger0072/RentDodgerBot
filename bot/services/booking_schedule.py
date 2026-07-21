@@ -740,6 +740,7 @@ async def format_user_booking_availability_block(
         )
     )
     cursor = now_u
+    ended_busy_slot = False
     lines: list[str] = []
     if recurring_mode:
         lines.append(
@@ -821,10 +822,19 @@ async def format_user_booking_availability_block(
                 add_finite(sa, se)
         if cursor < eu:
             cursor = eu
+            ended_busy_slot = True
         if recurring_mode:
             if exception_lines >= _AVAIL_UI_MAX_LINES - 1:
                 break
         elif len(lines) >= _AVAIL_UI_MAX_LINES:
+            break
+
+    if recurring_mode and ended_busy_slot and exception_lines < _AVAIL_UI_MAX_LINES - 1:
+        # Общая строка ежедневного окна не показывает, что его текущая часть
+        # начинается только после окончания занятого слота. Добавляем один
+        # конкретный остаток окна после последней брони/аренды.
+        for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
+            add_finite(sa, se)
             break
 
     if not recurring_mode and len(lines) < _AVAIL_UI_MAX_LINES:
