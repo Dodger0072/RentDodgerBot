@@ -856,6 +856,18 @@ async def format_user_booking_availability_block(
             add_finite(sa, se)
             break
 
+        # Если первый остаток перекрыт следующими слотами или в нём нельзя
+        # уложить минимальный срок, всё равно показываем ближайшее окно после
+        # последней известной брони/аренды.
+        last_rr_end = max(
+            (be for _, be in rr if be > tail_start),
+            default=None,
+        )
+        if last_rr_end is not None and last_rr_end > tail_start:
+            for sa, se in free_segments_excluding_blackout(last_rr_end, horizon, bo):
+                add_finite(sa, se)
+                break
+
     if not recurring_mode and len(lines) < _AVAIL_UI_MAX_LINES:
         for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
             if len(lines) >= _AVAIL_UI_MAX_LINES:
