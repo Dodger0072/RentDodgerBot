@@ -119,6 +119,38 @@ async def notify_admins_user_cancelled_reservation(
             continue
 
 
+async def notify_admins_user_cancelled_rental(
+    bot: Bot,
+    settings: Settings,
+    item: Item | None,
+    *,
+    rental_id: int,
+    user_id: int,
+    username: str | None,
+    hours: int,
+) -> None:
+    """Сообщает арендодателям, что пользователь снял ещё не обработанную заявку."""
+    name = escape(item.name) if item else "?"
+    iid = item.id if item else "?"
+    uname = escape((username or "—").lstrip("@"))
+    text = (
+        "ℹ️ <b>Пользователь отменил заявку на аренду</b>\n"
+        f"Заявка id: <code>{rental_id}</code>\n"
+        f"Вещь: {name} (id {iid})\n"
+        f"Пользователь: @{uname} ({user_id})\n"
+        f"Часов по заявке: {hours}\n\n"
+        "<i>Заявка снята до решения администратора.</i>"
+    )
+    recipients = item_notification_recipients(item, settings) if item is not None else []
+    if not recipients:
+        recipients = sorted(settings.admin_user_ids)
+    for admin_id in recipients:
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            continue
+
+
 def _admin_tag_html(user_id: int, username: str | None) -> str:
     u = (username or "").strip().lstrip("@")
     if u:

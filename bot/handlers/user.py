@@ -37,6 +37,7 @@ from bot.keyboards.inline import (
 from bot.services.admin_notify import (
     notify_admins_new_reservation,
     notify_admins_pending_rental,
+    notify_admins_user_cancelled_rental,
     notify_admins_user_cancelled_reservation,
 )
 from bot.services.booking_schedule import (
@@ -213,7 +214,8 @@ async def _send_user_item_card(target: Message, item_id: int, settings: Settings
     if st.pending_admin:
         extra = (
             "\n\n⏳ <b>Статус:</b> заявка на рассмотрении у администратора — "
-            "аренда и бронь временно недоступны."
+            "аренда и бронь временно недоступны. Если это ваша заявка, отмените её командой "
+            "<code>/cancel_rent</code>."
         )
     elif st.active_rental is not None:
         until_s = (
@@ -1063,11 +1065,98 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
         await session.commit()
     await state.clear()
     await query.message.edit_text(
-        "Заявка отправлена администратору. Ожидайте подтверждения.\n\n" + contact_html,
+        "Заявка отправлена администратору. Ожидайте подтверждения.\n\n"
+        "Если передумали до решения администратора — отправьте <code>/cancel_rent</code>.\n\n"
+        + contact_html,
         reply_markup=home_keyboard(),
         parse_mode=ParseMode.HTML,
     )
     await query.answer()
+
+
+@router.message(Command("cancel_rent", "cancel_rental"))
+async def cmd_cancel_pending_rental(message: Message, bot: Bot, settings: Settings) -> None:
+    """Позволяет пользователю снять свою заявку, пока она ожидает решения арендодателя."""
+    parts = (message.text or "").split(maxsplit=1)
+    requested_id: int | None = None
+    if len(parts) > 1:
+        try:
+            requested_id = int(parts[1].strip())
+        except ValueError:
+            await message.answer(
+                "Использование: <code>/cancel_rent</code> или <code>/cancel_rent &lt;id заявки&gt;</code>.",
+                reply_markup=home_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    async with db_session.async_session_maker() as session:
+        query = (
+            select(Rental)
+            .options(selectinload(Rental.item))
+            .where(
+                Rental.user_id == message.from_user.id,
+                Rental.state == RentalState.pending_admin.value,
+            )
+            .order_by(Rental.id.asc())
+        )
+        if requested_id is not None:
+            query = query.where(Rental.id == requested_id)
+        result = await session.execute(query)
+        pending = list(result.scalars().unique())
+
+        if not pending:
+            await session.rollback()
+            await message.answer(
+                "У вас нет заявок на аренду, ожидающих решения администратора.",
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        if requested_id is None and len(pending) > 1:
+            lines = ["У вас несколько заявок, ожидающих решения. Укажите, какую отменить:"]
+            for rental in pending:
+                item_name = escape(rental.item.name if rental.item else "?")
+                lines.append(f"• <code>/cancel_rent {rental.id}</code> — {item_name}")
+            await session.rollback()
+            await message.answer("\n".join(lines), reply_markup=home_keyboard(), parse_mode=ParseMode.HTML)
+            return
+
+        rental = pending[0]
+        rental_id = rental.id
+        item = rental.item
+        item_name = item.name if item else "?"
+        username = rental.username
+        hours = rental.requested_hours
+        admin_chat_id = rental.admin_message_chat_id
+        admin_message_id = rental.admin_message_id
+        await session.delete(rental)
+        await session.commit()
+
+    await notify_admins_user_cancelled_rental(
+        bot,
+        settings,
+        item,
+        rental_id=rental_id,
+        user_id=message.from_user.id,
+        username=username or message.from_user.username,
+        hours=hours,
+    )
+    if admin_chat_id is not None and admin_message_id is not None:
+        try:
+            await bot.edit_message_text(
+                "<i>Заявка отменена пользователем до решения администратора.</i>",
+                chat_id=int(admin_chat_id),
+                message_id=int(admin_message_id),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    await message.answer(
+        f"Заявка #{rental_id} на аренду «{escape(item_name)}» отменена.",
+        reply_markup=home_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(UserBookStates.waiting_hours, F.text)

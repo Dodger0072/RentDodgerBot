@@ -137,7 +137,8 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
     else:
         await message.answer(
             "Доступные действия: /start или кнопка «Начать», затем каталог аренды. "
-            "/my_bookings — ваши брони; отмена возможна до начала.",
+            "/my_bookings — ваши брони; отмена возможна до начала. "
+            "/cancel_rent — отменить свою заявку на аренду, пока её рассматривает администратор.",
             reply_markup=home_keyboard(),
         )
     if menu_seen:
