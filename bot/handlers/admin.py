@@ -2944,14 +2944,14 @@ async def cmd_bookings(message: Message, settings: Settings) -> None:
         await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-@router.message(Command("drop_request", "drop_pending"))
+@router.message(Command("drop_request", "drop_pending", "cancel_rent"))
 async def cmd_drop_pending_request(message: Message, settings: Settings) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Использование: /drop_request 5 — где 5 это id вещи из /list_items.\n"
+            "Использование: /cancel_rent 5 — где 5 это id вещи из /list_items.\n"
             "Команда вручную снимает зависшую заявку на выдачу (ожидает админа)."
         )
         return
