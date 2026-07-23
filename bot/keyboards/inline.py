@@ -176,10 +176,16 @@ def admin_family_discount_keyboard(rental_id: int, discount_percent: int) -> Inl
     return b.as_markup()
 
 def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMarkup:
-    preset = [1, 3, 6, 12, 24, 48, 72, 168]
-    hours = [h for h in preset if lo <= h <= hi]
-    if not hours:
+    """Быстрые сроки из допустимого для вещи диапазона; вручную админ может указать любой срок."""
+    lo = max(1, int(lo))
+    hi = min(168, int(hi))
+    if hi < lo:
+        hours: list[int] = []
+    elif hi - lo <= 7:
         hours = list(range(lo, hi + 1))
+    else:
+        # Для широкого диапазона оставляем привычные сроки и обязательно его границы.
+        hours = sorted({lo, hi, *[h for h in (3, 6, 12, 24, 72, 168) if lo <= h <= hi]})
     b = InlineKeyboardBuilder()
     row: list[InlineKeyboardButton] = []
     for h in hours:

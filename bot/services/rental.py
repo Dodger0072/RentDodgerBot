@@ -77,10 +77,14 @@ def format_money(value: Decimal) -> str:
 
 
 def price_for_hours(
-    item: Item, hours: int, *, family_discount_percent: int = 0
+    item: Item,
+    hours: int,
+    *,
+    family_discount_percent: int = 0,
+    enforce_item_bounds: bool = True,
 ) -> Decimal:
     lo, hi = rent_hours_bounds(item)
-    if hours < lo or hours > hi:
+    if enforce_item_bounds and (hours < lo or hours > hi):
         kind = "Платная" if item.is_paid else "Бесплатная"
         raise ValueError(f"{kind} аренда (эта вещь): от {lo} до {hi} ч.")
     if not item.is_paid:

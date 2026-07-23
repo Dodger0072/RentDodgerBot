@@ -666,9 +666,8 @@ async def _finalize_rental_handover(
     item = r_item.scalar_one()
     if not admin_manages_item(acting_user_id, item):
         return False, "Эта заявка относится не к вашим вещам."
-    lo, hi = rent_hours_bounds(item)
-    if hours < lo or hours > hi:
-        return False, f"Часы должны быть от {lo} до {hi} (по правилам этой вещи)."
+    if hours < 1 or hours > MAX_RENT_HOURS:
+        return False, f"Срок должен быть от 1 до {MAX_RENT_HOURS} ч."
     end = now + timedelta(hours=hours)
     req_hours = rental.requested_hours
     rental.state = RentalState.active.value
@@ -676,7 +675,10 @@ async def _finalize_rental_handover(
     rental.end_at = end
     try:
         total = price_for_hours(
-            item, hours, family_discount_percent=rental.family_discount_percent
+            item,
+            hours,
+            family_discount_percent=rental.family_discount_percent,
+            enforce_item_bounds=False,
         )
     except ValueError:
         total = Decimal("0")
@@ -3818,7 +3820,8 @@ async def _start_handover_hours_selection(
     base = query.message.html_text or query.message.text or ""
     hint = (
         f"\n\n<i>Выберите срок сдачи кнопкой или отправьте число часов "
-        f"(от {lo} до {hi}) обычным сообщением в чат.</i>"
+        f"обычным сообщением в чат. Кнопки — в пределах срока вещи ({lo}–{hi} ч.); "
+        f"вручную можно указать от 1 до {MAX_RENT_HOURS} ч.</i>"
     )
     await query.message.edit_text(
         base + hint,
@@ -3976,11 +3979,10 @@ async def admin_handover_hours_text(message: Message, state: FSMContext, setting
             await state.clear()
             await message.answer("Заявка не найдена.")
             return
-        lo, hi = rent_hours_bounds(rent0.item)
     try:
         hours = int((message.text or "").strip())
     except ValueError:
-        await message.answer(f"Нужно целое число часов (для этой вещи: от {lo} до {hi}).")
+        await message.answer(f"Нужно целое число часов от 1 до {MAX_RENT_HOURS}.")
         return
     async with db_session.async_session_maker() as session:
         ok, text = await _finalize_rental_handover(
