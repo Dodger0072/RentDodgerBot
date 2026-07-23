@@ -841,7 +841,15 @@ async def format_user_booking_availability_block(
     known_tail_start = ensure_utc(known_busy_until)
     if known_tail_start is not None and known_tail_start <= now_u:
         known_tail_start = None
-    tail_start = known_tail_start or (cursor if ended_busy_slot else None)
+    # Статус текущей аренды может закончиться уже внутри следующей брони. Для
+    # подсказки берём позднейшую границу, иначе появится ложное окно между
+    # окончанием аренды и окончанием фактически уже начавшейся брони.
+    tail_candidates = [
+        point
+        for point in (known_tail_start, cursor if ended_busy_slot else None)
+        if point is not None
+    ]
+    tail_start = max(tail_candidates) if tail_candidates else None
     if recurring_mode and tail_start is not None and exception_lines < _AVAIL_UI_MAX_LINES - 1:
         # Общая строка ежедневного окна не показывает, что его текущая часть
         # начинается только после окончания занятого слота. Добавляем один
