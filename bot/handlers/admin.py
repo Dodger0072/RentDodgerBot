@@ -3815,7 +3815,13 @@ async def admin_rental_warn(query: CallbackQuery, bot: Bot, settings: Settings) 
 
 
 async def _start_handover_hours_selection(
-    query: CallbackQuery, state: FSMContext, *, rental_id: int, lo: int, hi: int
+    query: CallbackQuery,
+    state: FSMContext,
+    *,
+    rental_id: int,
+    lo: int,
+    hi: int,
+    requested_hours: int,
 ) -> None:
     base = query.message.html_text or query.message.text or ""
     hint = (
@@ -3825,7 +3831,7 @@ async def _start_handover_hours_selection(
     )
     await query.message.edit_text(
         base + hint,
-        reply_markup=admin_hours_keyboard(rental_id, lo, hi),
+        reply_markup=admin_hours_keyboard(rental_id, lo, hi, requested_hours),
         parse_mode=ParseMode.HTML,
     )
     await state.set_state(AdminRentalStates.waiting_handover_hours)
@@ -3872,7 +3878,14 @@ async def admin_rental_ok(query: CallbackQuery, state: FSMContext, settings: Set
         )
         await _safe_query_answer(query)
         return
-    await _start_handover_hours_selection(query, state, rental_id=rid, lo=lo, hi=hi)
+    await _start_handover_hours_selection(
+        query,
+        state,
+        rental_id=rid,
+        lo=lo,
+        hi=hi,
+        requested_hours=rental.requested_hours,
+    )
     await _safe_query_answer(query)
 
 
@@ -3900,7 +3913,14 @@ async def admin_rental_family_discount_decision(
             rental.family_discount_percent = 0
             await session.commit()
         lo, hi = rent_hours_bounds(rental.item)
-    await _start_handover_hours_selection(query, state, rental_id=rid, lo=lo, hi=hi)
+    await _start_handover_hours_selection(
+        query,
+        state,
+        rental_id=rid,
+        lo=lo,
+        hi=hi,
+        requested_hours=rental.requested_hours,
+    )
     await _safe_query_answer(query)
 
 

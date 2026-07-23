@@ -175,7 +175,9 @@ def admin_family_discount_keyboard(rental_id: int, discount_percent: int) -> Inl
     b.row(InlineKeyboardButton(text="Отмена", callback_data=f"adm:r:{rental_id}:cancel"))
     return b.as_markup()
 
-def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMarkup:
+def admin_hours_keyboard(
+    rental_id: int, lo: int, hi: int, requested_hours: int
+) -> InlineKeyboardMarkup:
     """Быстрые сроки из допустимого для вещи диапазона; вручную админ может указать любой срок."""
     lo = max(1, int(lo))
     hi = min(168, int(hi))
@@ -186,6 +188,9 @@ def admin_hours_keyboard(rental_id: int, lo: int, hi: int) -> InlineKeyboardMark
     else:
         # Для широкого диапазона оставляем привычные сроки и обязательно его границы.
         hours = sorted({lo, hi, *[h for h in (3, 6, 12, 24, 72, 168) if lo <= h <= hi]})
+    if lo <= requested_hours <= hi and requested_hours not in hours:
+        hours.append(requested_hours)
+        hours.sort()
     b = InlineKeyboardBuilder()
     row: list[InlineKeyboardButton] = []
     for h in hours:
