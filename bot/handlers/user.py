@@ -1251,11 +1251,13 @@ async def user_book_confirm(
         except ValueError:
             total = Decimal("0")
         await notify_admins_new_reservation(bot, settings, item, res, total)
+        contact_html = await landlord_contact_hint_html(bot, item, settings)
         await session.commit()
     await state.clear()
     await query.message.edit_text(
         f"Бронь создана с {_fmt_utc_local(start_at, settings)} по {_fmt_utc_local(end_at, settings)}.\n\n"
-        f"<i>Свяжитесь с арендодателем вовремя — см. правила предупреждений выше.</i>\n\n"
+        f"<i>Свяжитесь с арендодателем ближе к началу брони.</i>\n\n"
+        f"{contact_html}\n\n"
         "/my_bookings — посмотреть или отменить бронь до её начала.",
         reply_markup=home_keyboard(),
         parse_mode=ParseMode.HTML,
