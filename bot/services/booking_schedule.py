@@ -770,16 +770,6 @@ async def format_user_booking_availability_block(
                 return True
         return False
 
-    def _next_rr_start_at_or_after(t: datetime) -> datetime | None:
-        t_u = ensure_utc(t)
-        if t_u is None:
-            return None
-        for bs, _ in rr:
-            bs_u = ensure_utc(bs)
-            if bs_u is not None and bs_u >= t_u:
-                return bs_u
-        return None
-
     def add_finite(sa: datetime, se: datetime) -> None:
         nonlocal lines, exception_lines
         if _skip_canonical_segment(sa, se):
@@ -821,12 +811,16 @@ async def format_user_booking_availability_block(
             sa_u = now_u
         lines.append(f"• с <b>{format_local_time(sa_u, settings)}</b>")
 
-    if recurring_mode and finite_blackouts:
-        # Общая строка «ежедневно» остаётся, а разовые окна показываем как
-        # исключения только на затронутых датах.
+    if recurring_mode:
+        # Общая строка «ежедневно» остаётся, а исключения строим из всех
+        # занятостей разом. Иначе разовое окно и бронь создают дублирующие,
+        # а иногда пересекающиеся строки для одной даты.
+        exception_blocked = merge_intervals_utc(rr + finite_blackouts)
         exception_days: set[date] = set()
         tz = settings.display_tz
-        for bs, be in finite_blackouts:
+        for bs, be in exception_blocked:
+            if be <= now_u or bs >= horizon:
+                continue
             day = bs.astimezone(tz).date() - timedelta(days=1)
             last_day = be.astimezone(tz).date() + timedelta(days=1)
             while day <= last_day:
@@ -835,7 +829,7 @@ async def format_user_booking_availability_block(
                 )
                 if se > now_u and sa < horizon and any(
                     intervals_overlap(sa, se, x_start, x_end)
-                    for x_start, x_end in finite_blackouts
+                    for x_start, x_end in exception_blocked
                 ):
                     exception_days.add(day)
                 day += timedelta(days=1)
@@ -845,7 +839,7 @@ async def format_user_booking_availability_block(
             sa, se = _canonical_free_segment_bounds_utc(
                 day, recurring_bo_s, recurring_bo_e, tz
             )
-            parts = free_segments_excluding_blackout(sa, se, bo)
+            parts = free_segments_excluding_blackout(sa, se, exception_blocked)
             if not parts:
                 lines.append(
                     f"• <i>{format_local_time(sa, settings)} — в этот день недоступно.</i>"
@@ -855,7 +849,10 @@ async def format_user_booking_availability_block(
             for part_start, part_end in parts:
                 add_finite(part_start, part_end)
 
-    for s, e in rr:
+    # При ежедневном графике занятости уже учтены выше как точечные
+    # исключения. В обычном режиме оставляем прежний расчёт всех окон.
+    rr_for_display = [] if recurring_mode else rr
+    for s, e in rr_for_display:
         su, eu = ensure_utc(s), ensure_utc(e)
         if su is None or eu is None:
             continue
@@ -875,42 +872,6 @@ async def format_user_booking_availability_block(
                 break
         elif len(lines) >= _AVAIL_UI_MAX_LINES:
             break
-
-    known_tail_start = ensure_utc(known_busy_until)
-    if known_tail_start is not None and known_tail_start <= now_u:
-        known_tail_start = None
-    # Статус текущей аренды может закончиться уже внутри следующей брони. Для
-    # подсказки берём позднейшую границу, иначе появится ложное окно между
-    # окончанием аренды и окончанием фактически уже начавшейся брони.
-    tail_candidates = [
-        point
-        for point in (known_tail_start, cursor if ended_busy_slot else None)
-        if point is not None
-    ]
-    tail_start = max(tail_candidates) if tail_candidates else None
-    if recurring_mode and tail_start is not None and exception_lines < _AVAIL_UI_MAX_LINES - 1:
-        # Общая строка ежедневного окна не показывает, что его текущая часть
-        # начинается только после окончания занятого слота. Добавляем один
-        # конкретный остаток окна после последней брони/аренды. Его нельзя
-        # показывать дальше следующей брони/аренды.
-        for sa, se in free_segments_excluding_blackout(tail_start, horizon, bo):
-            next_rr_start = _next_rr_start_at_or_after(sa)
-            if next_rr_start is not None and next_rr_start < se:
-                se = next_rr_start
-            add_finite(sa, se)
-            break
-
-        # Если первый остаток перекрыт следующими слотами или в нём нельзя
-        # уложить минимальный срок, всё равно показываем ближайшее окно после
-        # последней известной брони/аренды.
-        last_rr_end = max(
-            (be for _, be in rr if be > tail_start),
-            default=None,
-        )
-        if last_rr_end is not None and last_rr_end > tail_start:
-            for sa, se in free_segments_excluding_blackout(last_rr_end, horizon, bo):
-                add_finite(sa, se)
-                break
 
     if not recurring_mode and len(lines) < _AVAIL_UI_MAX_LINES:
         for sa, se in free_segments_excluding_blackout(cursor, horizon, bo):
