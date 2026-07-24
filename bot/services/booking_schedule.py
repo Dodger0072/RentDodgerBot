@@ -566,17 +566,19 @@ async def _load_recurring_daily_blackout_minutes(
     return out
 
 
-async def _has_non_recurring_blackout_in_range(
+async def _load_non_recurring_blackout_intervals_utc(
     session: AsyncSession,
     item_id: int,
     range_start: datetime,
     range_end: datetime,
-) -> bool:
+) -> list[tuple[datetime, datetime]]:
+    """Разовые окна неактива: они отображаются как исключения из ежедневного графика."""
     rs, re = ensure_utc(range_start), ensure_utc(range_end)
-    if rs is None or re is None:
-        return False
-    r = await session.execute(
-        select(AdminBlackoutWindow.id)
+    if rs is None or re is None or re <= rs:
+        return []
+    out: list[tuple[datetime, datetime]] = []
+    r_windows = await session.execute(
+        select(AdminBlackoutWindow.start_at, AdminBlackoutWindow.end_at)
         .select_from(BlackoutWindowItem)
         .join(AdminBlackoutWindow, AdminBlackoutWindow.id == BlackoutWindowItem.window_id)
         .where(
@@ -585,21 +587,20 @@ async def _has_non_recurring_blackout_in_range(
             AdminBlackoutWindow.start_at < re,
             AdminBlackoutWindow.end_at > rs,
         )
-        .limit(1)
     )
-    if r.scalar_one_or_none() is not None:
-        return True
-    r_leg = await session.execute(
-        select(ItemBlackout.id)
-        .where(
+    for start_at, end_at in r_windows.all():
+        _append_blackout_interval({item_id: out}, item_id, start_at, end_at)
+    r_legacy = await session.execute(
+        select(ItemBlackout.start_at, ItemBlackout.end_at).where(
             ItemBlackout.item_id == item_id,
             ItemBlackout.window_id.is_(None),
             ItemBlackout.start_at < re,
             ItemBlackout.end_at > rs,
         )
-        .limit(1)
     )
-    return r_leg.scalar_one_or_none() is not None
+    for start_at, end_at in r_legacy.all():
+        _append_blackout_interval({item_id: out}, item_id, start_at, end_at)
+    return merge_intervals_utc(out)
 
 
 def _parse_avail_line_clock_times(line: str) -> tuple[str, str] | None:
@@ -720,9 +721,7 @@ async def format_user_booking_availability_block(
     recurring_bo_e = 0
     recurring_free_start = 0
     recurring_free_end = 0
-    if len(recurring_bo) == 1 and not await _has_non_recurring_blackout_in_range(
-        session, item_id, now_u, horizon
-    ):
+    if len(recurring_bo) == 1:
         recurring_mode = True
         recurring_bo_s, recurring_bo_e = recurring_bo[0]
         recurring_free_start, recurring_free_end = _free_booking_display_minutes_from_blackout(
@@ -737,6 +736,11 @@ async def format_user_booking_availability_block(
             range_start=now_u - timedelta(days=1),
             range_end=horizon,
         )
+    )
+    finite_blackouts = (
+        await _load_non_recurring_blackout_intervals_utc(session, item_id, now_u, horizon)
+        if recurring_mode
+        else []
     )
     cursor = now_u
     ended_busy_slot = False
@@ -816,6 +820,40 @@ async def format_user_booking_availability_block(
         if sa_u < now_u:
             sa_u = now_u
         lines.append(f"• с <b>{format_local_time(sa_u, settings)}</b>")
+
+    if recurring_mode and finite_blackouts:
+        # Общая строка «ежедневно» остаётся, а разовые окна показываем как
+        # исключения только на затронутых датах.
+        exception_days: set[date] = set()
+        tz = settings.display_tz
+        for bs, be in finite_blackouts:
+            day = bs.astimezone(tz).date() - timedelta(days=1)
+            last_day = be.astimezone(tz).date() + timedelta(days=1)
+            while day <= last_day:
+                sa, se = _canonical_free_segment_bounds_utc(
+                    day, recurring_bo_s, recurring_bo_e, tz
+                )
+                if se > now_u and sa < horizon and any(
+                    intervals_overlap(sa, se, x_start, x_end)
+                    for x_start, x_end in finite_blackouts
+                ):
+                    exception_days.add(day)
+                day += timedelta(days=1)
+        for day in sorted(exception_days):
+            if exception_lines >= _AVAIL_UI_MAX_LINES - 1:
+                break
+            sa, se = _canonical_free_segment_bounds_utc(
+                day, recurring_bo_s, recurring_bo_e, tz
+            )
+            parts = free_segments_excluding_blackout(sa, se, bo)
+            if not parts:
+                lines.append(
+                    f"• <i>{format_local_time(sa, settings)} — в этот день недоступно.</i>"
+                )
+                exception_lines += 1
+                continue
+            for part_start, part_end in parts:
+                add_finite(part_start, part_end)
 
     for s, e in rr:
         su, eu = ensure_utc(s), ensure_utc(e)
