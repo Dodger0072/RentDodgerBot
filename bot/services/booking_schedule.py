@@ -770,7 +770,9 @@ async def format_user_booking_availability_block(
                 return True
         return False
 
-    def add_finite(sa: datetime, se: datetime) -> None:
+    def add_finite(
+        sa: datetime, se: datetime, *, require_minimum_before_end: bool = False
+    ) -> None:
         nonlocal lines, exception_lines
         if _skip_canonical_segment(sa, se):
             return
@@ -786,7 +788,7 @@ async def format_user_booking_availability_block(
             sa_u = now_u
         # Перед чужой бронью/арендой нужно уложить минимум lo ч; окно «не дома»
         # ограничивает только момент начала — бронь может пересекаться с ним дальше.
-        if _right_edge_is_rr_start(se):
+        if require_minimum_before_end or _right_edge_is_rr_start(se):
             latest = se - timedelta(hours=lo)
         else:
             latest = se - timedelta(minutes=1)
@@ -847,7 +849,13 @@ async def format_user_booking_availability_block(
                 exception_lines += 1
                 continue
             for part_start, part_end in parts:
-                add_finite(part_start, part_end)
+                # Если исключение обрывает окно раньше обычного ежедневного
+                # конца, в оставшийся отрезок должен помещаться минимум аренды.
+                add_finite(
+                    part_start,
+                    part_end,
+                    require_minimum_before_end=part_end < se,
+                )
 
     # При ежедневном графике занятости уже учтены выше как точечные
     # исключения. В обычном режиме оставляем прежний расчёт всех окон.
