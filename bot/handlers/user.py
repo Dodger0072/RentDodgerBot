@@ -652,6 +652,15 @@ async def user_home(query: CallbackQuery, state: FSMContext, settings: Settings)
     await query.answer()
 
 
+@router.callback_query(F.data == "u:nickname:edit")
+async def user_server_nickname_edit(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(UserProfileStates.waiting_server_nickname)
+    await state.update_data(nickname_return_to_item_id=None)
+    await query.message.answer("Введите новый ник на сервере.")
+    await query.answer()
+
+
 @router.callback_query(F.data == "u:be_owner_info")
 async def user_become_owner_info(query: CallbackQuery) -> None:
     kb = InlineKeyboardBuilder()
