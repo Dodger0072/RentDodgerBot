@@ -153,6 +153,8 @@ class RentalHandoverStat(Base):
         nullable=True,
     )
     handed_over_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Self-rentals stay in rental statistics but do not incur a commission.
+    is_self_rental: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     handed_over_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

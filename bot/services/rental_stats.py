@@ -208,11 +208,13 @@ def record_handover_stat(
     amount: Decimal,
     handed_over_at: datetime,
     handed_over_by_user_id: int,
+    is_self_rental: bool = False,
 ) -> None:
     session.add(
         RentalHandoverStat(
             item_id=item_id,
             handed_over_by_user_id=int(handed_over_by_user_id),
+            is_self_rental=is_self_rental,
             amount=amount,
             handed_over_at=handed_over_at,
         )

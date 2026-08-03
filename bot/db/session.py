@@ -200,6 +200,20 @@ async def _migrate_sqlite_rental_handover_stat_actor(conn) -> None:
         )
 
 
+async def _migrate_sqlite_rental_handover_stat_self_rental(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(rental_handover_stats)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "is_self_rental" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE rental_handover_stats "
+                "ADD COLUMN is_self_rental BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+
+
 async def _migrate_sqlite_admin_blackout_recurring(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -239,6 +253,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_blackout_window(conn)
         await _migrate_sqlite_item_blackout_subscription_cols(conn)
         await _migrate_sqlite_rental_handover_stat_actor(conn)
+        await _migrate_sqlite_rental_handover_stat_self_rental(conn)
         await _migrate_sqlite_admin_blackout_recurring(conn)
 
     if async_session_maker is not None:

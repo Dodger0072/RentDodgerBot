@@ -636,6 +636,10 @@ def _landlord_tag_html(owner_user_id: int | None, owner_username: str | None) ->
     return "администратора"
 
 
+def _username_normalized(username: str | None) -> str:
+    return (username or "").strip().lstrip("@").casefold()
+
+
 def _user_complaint_keyboard(kind: str, rental_id: int, owner_user_id: int) -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
     b.row(
@@ -682,12 +686,18 @@ async def _finalize_rental_handover(
         )
     except ValueError:
         total = Decimal("0")
+    owner_username = _username_normalized(item.owner_username)
+    renter_username = _username_normalized(rental.username)
+    is_self_rental = (
+        item.owner_user_id is not None and int(item.owner_user_id) == int(rental.user_id)
+    ) or (bool(owner_username) and owner_username == renter_username)
     record_handover_stat(
         session,
         item_id=rental.item_id,
         amount=total,
         handed_over_at=now,
         handed_over_by_user_id=acting_user_id,
+        is_self_rental=is_self_rental,
     )
     owner_uid = int(item.owner_user_id) if item.owner_user_id is not None else int(acting_user_id)
     await log_rental_event(

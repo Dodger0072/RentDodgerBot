@@ -172,6 +172,7 @@ async def build_invoices_for_range_and_notify(
             Item.owner_user_id.is_not(None),
             RentalHandoverStat.handed_over_at >= start_utc,
             RentalHandoverStat.handed_over_at < end_utc,
+            RentalHandoverStat.is_self_rental.is_(False),
         ]
         if owner_user_id is not None:
             where_clauses.append(Item.owner_user_id == int(owner_user_id))
