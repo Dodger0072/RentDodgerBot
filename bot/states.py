@@ -34,6 +34,10 @@ class UserRentStates(StatesGroup):
     waiting_confirm = State()
 
 
+class UserProfileStates(StatesGroup):
+    waiting_server_nickname = State()
+
+
 class UserBookStates(StatesGroup):
     waiting_start_datetime = State()
     waiting_hours = State()

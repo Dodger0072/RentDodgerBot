@@ -22,6 +22,15 @@ class UserBotState(Base):
     main_menu_seen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class UserProfile(Base):
+    """Профиль пользователя, привязанный к его неизменяемому Telegram user id."""
+
+    __tablename__ = "user_profiles"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    server_nickname: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
 class UserRentalDiscipline(Base):
     """Предупреждения арендатора: 3 → бан; успешные выдачи обнуляют счётчик предупреждений."""
 
@@ -246,6 +255,7 @@ class Rental(Base):
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     username = mapped_column(String(255), nullable=True)
+    server_nickname: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     start_at = mapped_column(DateTime(timezone=True), nullable=True)
     end_at = mapped_column(DateTime(timezone=True), nullable=True)
@@ -267,6 +277,7 @@ class Reservation(Base):
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     username = mapped_column(String(255), nullable=True)
+    server_nickname: Mapped[str | None] = mapped_column(String(64), nullable=True)
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     requested_hours: Mapped[int] = mapped_column(Integer, nullable=False)

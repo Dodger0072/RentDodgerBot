@@ -110,6 +110,16 @@ async def _migrate_sqlite_rental_no_response_penalty(conn) -> None:
         )
 
 
+async def _migrate_sqlite_server_nicknames(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    for table in ("rentals", "reservations"):
+        r = await conn.execute(text(f"PRAGMA table_info({table})"))
+        cols = {row[1] for row in r.fetchall()}
+        if "server_nickname" not in cols:
+            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN server_nickname VARCHAR(64)"))
+
+
 async def _migrate_sqlite_item_blackout_window(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -250,6 +260,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_rent_hours(conn)
         await _migrate_sqlite_family_discount(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
+        await _migrate_sqlite_server_nicknames(conn)
         await _migrate_sqlite_item_blackout_window(conn)
         await _migrate_sqlite_item_blackout_subscription_cols(conn)
         await _migrate_sqlite_rental_handover_stat_actor(conn)

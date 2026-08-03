@@ -2582,8 +2582,9 @@ async def cmd_delete_blackout(message: Message, settings: Settings) -> None:
 
 def _booking_line_reservation(res: Reservation, settings: Settings) -> str:
     un = escape((res.username or "—").lstrip("@"))
+    server_nickname = escape(res.server_nickname or "—")
     return (
-        f"• <b>[бронь] #{res.id}</b> @{un} | "
+        f"• <b>[бронь] #{res.id}</b> @{un} | ник: {server_nickname} | "
         f"{format_local_time(res.start_at, settings)} → "
         f"{format_local_time(res.end_at, settings)} | {res.requested_hours} ч."
     )
@@ -2591,12 +2592,13 @@ def _booking_line_reservation(res: Reservation, settings: Settings) -> str:
 
 def _booking_line_rental(rent: Rental, settings: Settings) -> str:
     un = escape((rent.username or "—").lstrip("@"))
+    server_nickname = escape(rent.server_nickname or "—")
     st = ensure_utc(rent.start_at)
     en = ensure_utc(rent.end_at)
     start_l = format_local_time(st, settings) if st else "?"
     end_l = format_local_time(en, settings) if en else "?"
     return (
-        f"• <b>[аренда] #{rent.id}</b> @{un} | "
+        f"• <b>[аренда] #{rent.id}</b> @{un} | ник: {server_nickname} | "
         f"{start_l} → {end_l} | {rent.requested_hours} ч."
     )
 

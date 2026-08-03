@@ -29,10 +29,12 @@ async def notify_admins_pending_rental(
 ) -> None:
     uname = rental.username or "—"
     uid = rental.user_id
+    server_nickname = rental.server_nickname or "—"
     text = (
         f"<b>{escape(heading)}</b>\n"
         f"Вещь: {escape(item.name)} (id {item.id})\n"
         f"Пользователь: @{uname} ({uid})\n"
+        f"Ник на сервере: {escape(server_nickname)}\n"
         f"Часов по заявке: {rental.requested_hours}\n"
         f"Планируемый конец (по заявке): {format_local_time(planned_end, settings)}\n"
         f"Сумма: {format_money(total) if item.is_paid else '0$ (бесплатно)'}\n"
@@ -64,11 +66,13 @@ async def notify_admins_new_reservation(
     """Информирование админов о создании брони (без действий в сообщении — управление: /bookings)."""
     uname = reservation.username or "—"
     uid = reservation.user_id
+    server_nickname = reservation.server_nickname or "—"
     text = (
         "<b>Новая бронь</b>\n"
         f"Бронь id: <code>{reservation.id}</code>\n"
         f"Вещь: {escape(item.name)} (id {item.id})\n"
         f"Пользователь: @{escape(uname.lstrip('@'))} ({uid})\n"
+        f"Ник на сервере: {escape(server_nickname)}\n"
         f"Часов: {reservation.requested_hours}\n"
         f"С: {format_local_time(reservation.start_at, settings)}\n"
         f"По: {format_local_time(reservation.end_at, settings)}\n"

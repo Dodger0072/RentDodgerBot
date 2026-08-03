@@ -183,6 +183,7 @@ async def process_reservation_booking_starts(bot: Bot, settings: Settings) -> No
                 item_id=item.id,
                 user_id=res.user_id,
                 username=res.username,
+                server_nickname=res.server_nickname,
                 state=RentalState.pending_admin.value,
                 start_at=start,
                 end_at=end,

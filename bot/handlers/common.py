@@ -12,6 +12,8 @@ from bot.services.user_bot_state import user_main_menu_seen
 from bot.keyboards.inline import home_keyboard
 from bot.keyboards.reply import remove_reply_keyboard, start_reply_keyboard
 from bot.main_menu import send_main_menu
+from bot.services.user_profile import get_server_nickname
+from bot.states import UserProfileStates
 
 router = Router(name="common")
 
@@ -25,7 +27,7 @@ class ReplyKeyboardStartFilter(BaseFilter):
 
 @router.message(ReplyKeyboardStartFilter())
 async def cmd_start_reply_button(message: Message, state: FSMContext, settings: Settings) -> None:
-    await send_main_menu(message, state, settings)
+    await _start_or_request_server_nickname(message, state, settings)
 
 
 _ADMIN_HELP_FULL = """<b>Команды администратора</b>
@@ -154,4 +156,21 @@ async def cmd_help(message: Message, state: FSMContext, settings: Settings) -> N
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, settings: Settings) -> None:
-    await send_main_menu(message, state, settings)
+    await _start_or_request_server_nickname(message, state, settings)
+
+
+async def _start_or_request_server_nickname(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    await state.clear()
+    async with db_session.async_session_maker() as session:
+        nickname = await get_server_nickname(session, message.from_user.id)
+        await session.commit()
+    if nickname:
+        await send_main_menu(message, state, settings)
+        return
+    await state.set_state(UserProfileStates.waiting_server_nickname)
+    await state.update_data(nickname_return_to_item_id=None)
+    await message.answer(
+        "Введите ваш ник на сервере.",
+    )

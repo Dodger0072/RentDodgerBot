@@ -70,9 +70,45 @@ from bot.services.rental import (
 )
 from bot.services.rental_logs import log_rental_event
 from bot.services.user_discipline import booking_rules_block, near_ban_notice_for_user
-from bot.states import UserBookStates, UserComplaintStates, UserRentStates
+from bot.services.user_profile import (
+    get_server_nickname,
+    normalize_server_nickname,
+    save_server_nickname,
+)
+from bot.main_menu import send_main_menu
+from bot.states import UserBookStates, UserComplaintStates, UserProfileStates, UserRentStates
 
 router = Router(name="user")
+
+
+async def _prompt_server_nickname(message: Message, state: FSMContext, item_id: int) -> None:
+    await state.clear()
+    await state.set_state(UserProfileStates.waiting_server_nickname)
+    await state.update_data(nickname_return_to_item_id=item_id)
+    await message.answer(
+        "Перед оформлением укажите ваш ник на сервере.",
+    )
+
+
+@router.message(UserProfileStates.waiting_server_nickname, F.text)
+async def user_server_nickname(message: Message, state: FSMContext, settings: Settings) -> None:
+    nickname = normalize_server_nickname(message.text or "")
+    if nickname is None:
+        await message.answer(
+            "Ник не может быть пустым. Введите ваш ник на сервере.",
+        )
+        return
+    data = await state.get_data()
+    item_id = data.get("nickname_return_to_item_id")
+    async with db_session.async_session_maker() as session:
+        await save_server_nickname(session, message.from_user.id, nickname)
+        await session.commit()
+    await state.clear()
+    await message.answer(f"Ник на сервере <b>{escape(nickname)}</b> сохранён.", parse_mode=ParseMode.HTML)
+    if item_id is not None:
+        await _send_user_item_card(message, int(item_id), settings)
+    else:
+        await send_main_menu(message, state, settings)
 
 
 def _my_reservations_keyboard(reservations: list[Reservation], *, now: datetime) -> InlineKeyboardMarkup:
@@ -692,6 +728,7 @@ async def user_complaint_submit(message: Message, state: FSMContext, settings: S
 async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     item_id = int(query.data.split(":")[1])
     notice = ""
+    server_nickname = None
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
         await session.commit()
@@ -702,7 +739,12 @@ async def user_take_start(query: CallbackQuery, state: FSMContext, settings: Set
         )
         item = r_item.scalar_one_or_none()
         notice = await near_ban_notice_for_user(session, query.from_user.id)
+        server_nickname = await get_server_nickname(session, query.from_user.id)
         await session.commit()
+    if not server_nickname:
+        await _prompt_server_nickname(query.message, state, item_id)
+        await query.answer()
+        return
     if st is None or item is None:
         await query.answer("Ошибка", show_alert=True)
         return
@@ -737,7 +779,13 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
     item_id = int(query.data.split(":")[1])
     async with db_session.async_session_maker() as session:
         await expire_expired_rentals(session)
+        server_nickname = await get_server_nickname(session, query.from_user.id)
         await session.commit()
+    if not server_nickname:
+        await _prompt_server_nickname(query.message, state, item_id)
+        await query.answer()
+        return
+    async with db_session.async_session_maker() as session:
         st = await user_facing_status(session, item_id)
     if st is None:
         await query.answer("Ошибка", show_alert=True)
@@ -1032,10 +1080,17 @@ async def user_rent_confirm(query: CallbackQuery, state: FSMContext, bot: Bot, s
             await state.clear()
             return
         total = price_for_hours(item, hours, family_discount_percent=discount)
+        server_nickname = await get_server_nickname(session, query.from_user.id)
+        if not server_nickname:
+            await session.rollback()
+            await _prompt_server_nickname(query.message, state, item_id)
+            await query.answer()
+            return
         rental = Rental(
             item_id=item_id,
             user_id=query.from_user.id,
             username=query.from_user.username,
+            server_nickname=server_nickname,
             state=RentalState.pending_admin.value,
             start_at=now,
             end_at=planned_end,
@@ -1234,10 +1289,17 @@ async def user_book_confirm(
             await query.answer(err, show_alert=True)
             await state.clear()
             return
+        server_nickname = await get_server_nickname(session, query.from_user.id)
+        if not server_nickname:
+            await session.rollback()
+            await _prompt_server_nickname(query.message, state, item_id)
+            await query.answer()
+            return
         res = Reservation(
             item_id=item_id,
             user_id=query.from_user.id,
             username=query.from_user.username,
+            server_nickname=server_nickname,
             start_at=start_at,
             end_at=end_at,
             requested_hours=hours,
