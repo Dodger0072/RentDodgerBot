@@ -81,6 +81,16 @@ from bot.states import UserBookStates, UserComplaintStates, UserProfileStates, U
 router = Router(name="user")
 
 
+async def _catalog_keyboard_for_user(user_id: int, username: str | None, settings: Settings):
+    async with db_session.async_session_maker() as session:
+        server_nickname = await get_server_nickname(session, user_id)
+        await session.commit()
+    return category_keyboard_for_admin(
+        is_admin_user=is_admin(user_id, username, settings),
+        server_nickname=server_nickname,
+    )
+
+
 async def _prompt_server_nickname(message: Message, state: FSMContext, item_id: int) -> None:
     await state.clear()
     await state.set_state(UserProfileStates.waiting_server_nickname)
@@ -548,8 +558,8 @@ async def user_back(query: CallbackQuery, state: FSMContext, settings: Settings)
     await state.clear()
     await query.message.answer(
         "Выберите каталог:",
-        reply_markup=category_keyboard_for_admin(
-            is_admin_user=is_admin(query.from_user.id, query.from_user.username, settings)
+        reply_markup=await _catalog_keyboard_for_user(
+            query.from_user.id, query.from_user.username, settings
         ),
     )
     await query.answer()
@@ -636,7 +646,12 @@ async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Setti
         return
 
     await state.clear()
-    await query.message.answer("Выберите каталог:", reply_markup=category_keyboard())
+    await query.message.answer(
+        "Выберите каталог:",
+        reply_markup=await _catalog_keyboard_for_user(
+            query.from_user.id, query.from_user.username, settings
+        ),
+    )
     await query.answer()
 
 
@@ -645,8 +660,8 @@ async def user_home(query: CallbackQuery, state: FSMContext, settings: Settings)
     await state.clear()
     await query.message.answer(
         "Выберите каталог:",
-        reply_markup=category_keyboard_for_admin(
-            is_admin_user=is_admin(query.from_user.id, query.from_user.username, settings)
+        reply_markup=await _catalog_keyboard_for_user(
+            query.from_user.id, query.from_user.username, settings
         ),
     )
     await query.answer()

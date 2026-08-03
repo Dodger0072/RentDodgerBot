@@ -7,6 +7,7 @@ from aiogram.types import Message
 from bot.config import Settings, is_admin
 from bot.db import session as db_session
 from bot.services.user_bot_state import mark_main_menu_seen, user_main_menu_seen
+from bot.services.user_profile import get_server_nickname
 from bot.keyboards.inline import category_keyboard_for_admin
 from bot.keyboards.reply import remove_reply_keyboard
 
@@ -25,6 +26,7 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
     uid = message.from_user.id
     async with db_session.async_session_maker() as session:
         first_menu = not await user_main_menu_seen(session, uid)
+        server_nickname = await get_server_nickname(session, uid)
         await session.commit()
 
     extra = ""
@@ -37,7 +39,10 @@ async def send_main_menu(message: Message, state: FSMContext, settings: Settings
     admin_user = is_admin(message.from_user.id, message.from_user.username, settings)
     await message.answer(
         _RENTAL_TYPES_INFO + extra,
-        reply_markup=category_keyboard_for_admin(is_admin_user=admin_user),
+        reply_markup=category_keyboard_for_admin(
+            is_admin_user=admin_user,
+            server_nickname=server_nickname,
+        ),
         parse_mode=ParseMode.HTML,
     )
     footer = (

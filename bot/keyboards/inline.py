@@ -61,24 +61,43 @@ def inventory_subcategory_keyboard(
     return b.as_markup()
 
 
-def category_keyboard() -> InlineKeyboardMarkup:
+def _nickname_edit_button_text(server_nickname: str | None) -> str:
+    nickname = (server_nickname or "").strip()
+    if nickname:
+        return f"Изменить ник ({nickname[:32]})"
+    return "Изменить ник на сервере"
+
+
+def category_keyboard(*, server_nickname: str | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(
         InlineKeyboardButton(text="Платная аренда", callback_data="cat:paid"),
         InlineKeyboardButton(text="Бесплатная аренда", callback_data="cat:free"),
     )
-    b.row(InlineKeyboardButton(text="Изменить ник на сервере", callback_data="u:nickname:edit"))
+    b.row(
+        InlineKeyboardButton(
+            text=_nickname_edit_button_text(server_nickname),
+            callback_data="u:nickname:edit",
+        )
+    )
     b.row(InlineKeyboardButton(text="Сдавать свои вещи", callback_data="u:be_owner_info"))
     return b.as_markup()
 
 
-def category_keyboard_for_admin(*, is_admin_user: bool) -> InlineKeyboardMarkup:
+def category_keyboard_for_admin(
+    *, is_admin_user: bool, server_nickname: str | None = None
+) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(
         InlineKeyboardButton(text="Платная аренда", callback_data="cat:paid"),
         InlineKeyboardButton(text="Бесплатная аренда", callback_data="cat:free"),
     )
-    b.row(InlineKeyboardButton(text="Изменить ник на сервере", callback_data="u:nickname:edit"))
+    b.row(
+        InlineKeyboardButton(
+            text=_nickname_edit_button_text(server_nickname),
+            callback_data="u:nickname:edit",
+        )
+    )
     b.row(InlineKeyboardButton(text="Сдавать свои вещи", callback_data="u:be_owner_info"))
     if is_admin_user:
         b.row(InlineKeyboardButton(text="Админ-панель", callback_data="adm:panel"))
