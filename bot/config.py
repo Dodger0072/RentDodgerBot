@@ -49,6 +49,8 @@ class Settings:
     bot_token: str
     admin_user_ids: set[int]
     admin_usernames: set[str]
+    configured_admin_user_ids: set[int]
+    configured_admin_usernames: set[str]
     superadmin_user_ids: set[int]
     database_url: str
     display_tz: ZoneInfo
@@ -96,10 +98,16 @@ def load_settings() -> Settings:
 
     tz_label = os.getenv("TIME_ZONE_LABEL", "МСК").strip()
 
+    admin_user_ids = _parse_int_list(os.getenv("ADMIN_USER_IDS"))
+    admin_usernames = _parse_username_list(os.getenv("ADMIN_USERNAMES"))
+
     return Settings(
         bot_token=token,
-        admin_user_ids=_parse_int_list(os.getenv("ADMIN_USER_IDS")),
-        admin_usernames=_parse_username_list(os.getenv("ADMIN_USERNAMES")),
+        # Эти множества дополняются сохранёнными администраторами после инициализации БД.
+        admin_user_ids=set(admin_user_ids),
+        admin_usernames=set(admin_usernames),
+        configured_admin_user_ids=admin_user_ids,
+        configured_admin_usernames=admin_usernames,
         superadmin_user_ids=_parse_int_list(os.getenv("SUPERADMIN_USER_IDS")),
         database_url=db,
         display_tz=tz,
@@ -111,6 +119,10 @@ def load_settings() -> Settings:
 
 
 def is_admin(user_id: int, username: str | None, settings: Settings) -> bool:
+    # Суперадмин всегда обладает правами обычного администратора, даже если
+    # его id не продублирован в ADMIN_USER_IDS.
+    if user_id in settings.superadmin_user_ids:
+        return True
     if user_id in settings.admin_user_ids:
         return True
     if username:

@@ -31,6 +31,21 @@ class UserProfile(Base):
     server_nickname: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
+class ManagedAdmin(Base):
+    """Администратор, добавленный суперадмином через интерфейс бота.
+
+    Админы из .env намеренно не копируются сюда: конфигурация остаётся источником
+    прав для них и не может быть случайно изменена из чата.
+    """
+
+    __tablename__ = "managed_admins"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username = mapped_column(String(255), nullable=True)
+    added_by_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class UserRentalDiscipline(Base):
     """Предупреждения арендатора: 3 → бан; успешные выдачи обнуляют счётчик предупреждений."""
 
@@ -68,6 +83,7 @@ class Item(Base):
     price_hour = mapped_column(Numeric(12, 2), nullable=True)
     price_day = mapped_column(Numeric(12, 2), nullable=True)
     price_week = mapped_column(Numeric(12, 2), nullable=True)
+    price_month = mapped_column(Numeric(12, 2), nullable=True)
     family_discount_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_paid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Shared id for paid/free cards of one physical item.

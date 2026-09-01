@@ -185,6 +185,15 @@ async def _migrate_sqlite_item_rent_hours(conn) -> None:
         await conn.execute(text("ALTER TABLE items ADD COLUMN rent_hours_max INTEGER"))
 
 
+async def _migrate_sqlite_item_price_month(conn) -> None:
+    if engine is None or "sqlite" not in str(engine.url).lower():
+        return
+    r = await conn.execute(text("PRAGMA table_info(items)"))
+    cols = {row[1] for row in r.fetchall()}
+    if "price_month" not in cols:
+        await conn.execute(text("ALTER TABLE items ADD COLUMN price_month NUMERIC(12, 2)"))
+
+
 async def _migrate_sqlite_family_discount(conn) -> None:
     if engine is None or "sqlite" not in str(engine.url).lower():
         return
@@ -258,6 +267,7 @@ async def init_db() -> None:
         await _migrate_sqlite_item_visibility(conn)
         await _migrate_sqlite_item_rental_group(conn)
         await _migrate_sqlite_item_rent_hours(conn)
+        await _migrate_sqlite_item_price_month(conn)
         await _migrate_sqlite_family_discount(conn)
         await _migrate_sqlite_rental_no_response_penalty(conn)
         await _migrate_sqlite_server_nicknames(conn)

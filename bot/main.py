@@ -22,6 +22,7 @@ from bot.handlers import admin, common, user
 from bot.middlewares import BanMiddleware, SettingsMiddleware
 from bot.services.reservation_reminders import reservation_reminder_loop
 from bot.services.subscription_billing import subscription_billing_loop
+from bot.services.admin_roles import load_managed_admin_ids
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ async def main() -> None:
     settings = load_settings()
     setup_engine(settings)
     await init_db()
+    await load_managed_admin_ids(settings)
 
     bot_kwargs: dict = {
         "default": DefaultBotProperties(parse_mode=ParseMode.HTML),

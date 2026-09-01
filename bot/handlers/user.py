@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from html import escape
 
@@ -43,10 +43,10 @@ from bot.services.booking_schedule import (
     blackout_max_end_covering_point_db,
     explain_booking_start_conflict,
     format_user_booking_availability_block,
+    hourly_booking_start_options,
     load_rr_busy_intervals_utc,
     max_hours_from_start,
     max_reservation_end_utc,
-    parse_booking_start_text,
     point_inside_busy,
     rent_lo_hi,
     reservation_fits,
@@ -145,11 +145,20 @@ def _item_caption(item: Item, settings: Settings, extra: str = "") -> str:
         f"<i>{escape(item_category_label(item.item_category))}</i>\n",
         escape(item.description),
     ]
-    if item.is_paid and item.price_hour is not None:
+    if item.is_paid:
+        tariffs = (
+            (item.price_hour, "час"),
+            (item.price_day, "сутки"),
+            (item.price_week, "неделя"),
+            (item.price_month, "месяц"),
+        )
         lines.append(
-            f"\nЦена: {format_money(item.price_hour)} / час, "
-            f"{format_money(item.price_day or 0)} / сутки, "
-            f"{format_money(item.price_week or 0)} / неделя"
+            "\nЦена: "
+            + ", ".join(
+                f"{format_money(price)} / {label}"
+                for price, label in tariffs
+                if price is not None
+            )
         )
     else:
         lines.append("\nБесплатная аренда")
@@ -390,50 +399,142 @@ async def _send_booking_start_prompt(
             select(Item).where(Item.id == item_id, Item.is_visible.is_(True))
         )
         book_item = r_item.scalar_one_or_none()
+        await session.commit()
     if book_item is None:
         await state.clear()
         await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
         return
-    notice = ""
-    avail_html = ""
-    async with db_session.async_session_maker() as session:
-        notice = await near_ban_notice_for_user(session, message.from_user.id)
-        known_busy_until = (
-            st.active_rental.end_at
-            if st.active_rental is not None
-            else st.reserved_until
-        )
-        avail_html = await format_user_booking_availability_block(
-            session,
-            item_id,
-            book_item,
-            settings,
-            now=datetime.now(UTC),
-            known_busy_until=known_busy_until,
-        )
-        await session.commit()
-    lines = [
-        "Введите дату и время <b>начала</b> брони.\n"
-        "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
-        "Пример: <code>04.05.2026 10:00</code>\n\n"
-        "Ниже — когда можно выбрать начало с учётом минимальной аренды; "
-        "слот не должен пересекаться с чужими бронями.\n\n",
-    ]
-    if st.in_blackout and st.blackout_until is not None:
-        lines.append(
-            f"\nСейчас до <b>{_fmt_utc_local(st.blackout_until, settings)}</b> владелец не сдаёт вещь — "
-            f"укажите начало <b>после</b> этого времени (слот не должен с этим пересекаться)."
-        )
-    lines.append(booking_rules_block())
-    if notice:
-        lines.append(notice)
-    lines.append("\n\n")
-    lines.append(avail_html)
+    await state.update_data(book_date_iso=None, book_start_iso=None, hours=None, total=None)
     await message.answer(
-        "".join(lines),
-        reply_markup=nav_back_keyboard(),
+        "Выберите дату <b>начала</b> брони. После этого я покажу свободное время.\n\n"
+        "Если нужной даты нет в кнопках, нажмите «Ввести дату вручную» "
+        "и отправьте её в формате <code>ДД.ММ.ГГГГ</code>.",
+        reply_markup=_booking_date_keyboard(settings),
         parse_mode=ParseMode.HTML,
     )
+
+
+_RU_MONTHS_GENITIVE = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+
+
+def _booking_date_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+    today = datetime.now(settings.display_tz).date()
+    keyboard = InlineKeyboardBuilder()
+    for offset in range(6):
+        day = today + timedelta(days=offset)
+        if offset == 0:
+            label = f"Сегодня ({day:%d.%m})"
+        elif offset == 1:
+            label = f"Завтра ({day:%d.%m})"
+        else:
+            label = f"{day.day} {_RU_MONTHS_GENITIVE[day.month - 1]}"
+        keyboard.row(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"book:date:{day:%Y%m%d}",
+            )
+        )
+    keyboard.row(InlineKeyboardButton(text="Ввести дату вручную", callback_data="book:date:manual"))
+    keyboard.row(InlineKeyboardButton(text="« Назад", callback_data="u:nav:back"))
+    return keyboard.as_markup()
+
+
+def _booking_time_keyboard(day: date, starts: list[datetime], settings: Settings) -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardBuilder()
+    row: list[InlineKeyboardButton] = []
+    for start in starts:
+        label = start.astimezone(settings.display_tz).strftime("%H:%M")
+        row.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"book:time:{day:%Y%m%d}:{label.replace(':', '')}",
+            )
+        )
+        if len(row) == 4:
+            keyboard.row(*row)
+            row = []
+    if row:
+        keyboard.row(*row)
+    keyboard.row(InlineKeyboardButton(text="Ввести время вручную", callback_data="book:time:manual"))
+    keyboard.row(InlineKeyboardButton(text="« Выбрать другую дату", callback_data="book:time:back"))
+    return keyboard.as_markup()
+
+
+async def _send_booking_time_prompt(
+    message: Message, item_id: int, selected_day: date, settings: Settings, state: FSMContext
+) -> None:
+    async with db_session.async_session_maker() as session:
+        await expire_expired_rentals(session)
+        pending = await session.scalar(
+            select(Rental.id).where(
+                Rental.item_id == item_id,
+                Rental.state == RentalState.pending_admin.value,
+            )
+        )
+        item = await session.scalar(select(Item).where(Item.id == item_id, Item.is_visible.is_(True)))
+        if pending is not None:
+            await session.rollback()
+            await state.clear()
+            await message.answer(
+                "Есть ожидающая заявка у администратора — бронь недоступна.",
+                reply_markup=home_keyboard(),
+            )
+            return
+        if item is None:
+            await session.rollback()
+            await state.clear()
+            await message.answer("Вещь не найдена.", reply_markup=home_keyboard())
+            return
+        starts = await hourly_booking_start_options(
+            session,
+            item_id,
+            item,
+            selected_day,
+            settings,
+            now=datetime.now(UTC),
+        )
+        await session.commit()
+    day_label = f"{selected_day.day} {_RU_MONTHS_GENITIVE[selected_day.month - 1]}"
+    text = (
+        f"Выберите свободное время начала на <b>{day_label}</b>.\n"
+        "В кнопках показано время на целый час; другое время можно ввести вручную "
+        "в формате <code>ЧЧ:ММ</code>."
+    )
+    if not starts:
+        text = (
+            f"На <b>{day_label}</b> нет свободного начала на целый час. "
+            "Можно ввести другое время вручную в формате <code>ЧЧ:ММ</code> "
+            "или выбрать другую дату."
+        )
+    await message.answer(
+        text,
+        reply_markup=_booking_time_keyboard(selected_day, starts, settings),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _select_booking_date(
+    message: Message, state: FSMContext, item_id: int, selected_day: date, settings: Settings
+) -> None:
+    if selected_day < datetime.now(settings.display_tz).date():
+        await message.answer("Дата брони не может быть в прошлом.", reply_markup=_booking_date_keyboard(settings))
+        return
+    await state.update_data(book_date_iso=selected_day.isoformat(), book_start_iso=None, hours=None, total=None)
+    await state.set_state(UserBookStates.waiting_start_time)
+    await _send_booking_time_prompt(message, item_id, selected_day, settings, state)
 
 
 async def _resend_book_hours_prompt(
@@ -632,13 +733,21 @@ async def user_nav_back(query: CallbackQuery, state: FSMContext, settings: Setti
 
     if st == UserBookStates.waiting_hours.state:
         item_id = int(data.get("item_id", 0))
-        await state.set_state(UserBookStates.waiting_start_datetime)
-        await state.update_data(book_start_iso=None, hours=None, total=None)
+        await state.set_state(UserBookStates.waiting_start_date)
+        await state.update_data(book_date_iso=None, book_start_iso=None, hours=None, total=None)
         await _send_booking_start_prompt(query.message, item_id, settings, state)
         await query.answer()
         return
 
-    if st == UserBookStates.waiting_start_datetime.state:
+    if st == UserBookStates.waiting_start_time.state:
+        item_id = int(data.get("item_id", 0))
+        await state.set_state(UserBookStates.waiting_start_date)
+        await state.update_data(book_date_iso=None, book_start_iso=None, hours=None, total=None)
+        await _send_booking_start_prompt(query.message, item_id, settings, state)
+        await query.answer()
+        return
+
+    if st == UserBookStates.waiting_start_date.state:
         item_id = int(data.get("item_id", 0))
         await state.clear()
         await _send_user_item_card(query.message, item_id, settings)
@@ -826,25 +935,141 @@ async def user_book_start(query: CallbackQuery, state: FSMContext, settings: Set
         await query.answer("Вещь не найдена", show_alert=True)
         return
     await state.clear()
-    await state.set_state(UserBookStates.waiting_start_datetime)
+    await state.set_state(UserBookStates.waiting_start_date)
     await state.update_data(item_id=item_id, flow="book")
     await _send_booking_start_prompt(query.message, item_id, settings, state)
     await query.answer()
 
 
-@router.message(UserBookStates.waiting_start_datetime, F.text)
-async def user_book_start_datetime(message: Message, state: FSMContext, settings: Settings) -> None:
+@router.callback_query(F.data == "book:date:manual")
+async def user_book_date_manual(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if await state.get_state() != UserBookStates.waiting_start_date.state:
+        await query.answer("Начните бронирование заново.", show_alert=True)
+        return
+    await query.message.answer(
+        "Введите дату начала в формате <code>ДД.ММ.ГГГГ</code>, например <code>04.09.2026</code>.",
+        reply_markup=_booking_date_keyboard(settings),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^book:date:(\d{8})$"))
+async def user_book_date_choice(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
-    item_id = int(data["item_id"])
-    parsed = parse_booking_start_text(message.text or "", settings)
-    if parsed is None:
+    if await state.get_state() != UserBookStates.waiting_start_date.state or not data.get("item_id"):
+        await query.answer("Начните бронирование заново.", show_alert=True)
+        return
+    try:
+        selected_day = datetime.strptime((query.data or "").rsplit(":", 1)[1], "%Y%m%d").date()
+    except ValueError:
+        await query.answer("Некорректная дата", show_alert=True)
+        return
+    await _select_booking_date(query.message, state, int(data["item_id"]), selected_day, settings)
+    await query.answer()
+
+
+@router.message(UserBookStates.waiting_start_date, F.text)
+async def user_book_date_text(message: Message, state: FSMContext, settings: Settings) -> None:
+    data = await state.get_data()
+    try:
+        selected_day = datetime.strptime((message.text or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
         await message.answer(
-            "Не получилось разобрать дату. Используйте формат "
-            "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>, например <code>04.05.2026 10:00</code>.",
-            reply_markup=nav_back_keyboard(),
+            "Не получилось разобрать дату. Используйте формат <code>ДД.ММ.ГГГГ</code>, "
+            "например <code>04.09.2026</code>.",
+            reply_markup=_booking_date_keyboard(settings),
             parse_mode=ParseMode.HTML,
         )
         return
+    await _select_booking_date(message, state, int(data["item_id"]), selected_day, settings)
+
+
+@router.callback_query(F.data == "book:time:manual")
+async def user_book_time_manual(query: CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state() != UserBookStates.waiting_start_time.state:
+        await query.answer("Начните бронирование заново.", show_alert=True)
+        return
+    await query.message.answer("Введите время в формате <code>ЧЧ:ММ</code>, например <code>13:30</code>.", parse_mode=ParseMode.HTML)
+    await query.answer()
+
+
+@router.callback_query(F.data == "book:time:back")
+async def user_book_time_back(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    data = await state.get_data()
+    if await state.get_state() != UserBookStates.waiting_start_time.state or not data.get("item_id"):
+        await query.answer("Начните бронирование заново.", show_alert=True)
+        return
+    item_id = int(data["item_id"])
+    await state.set_state(UserBookStates.waiting_start_date)
+    await state.update_data(book_date_iso=None, book_start_iso=None, hours=None, total=None)
+    await _send_booking_start_prompt(query.message, item_id, settings, state)
+    await query.answer()
+
+
+@router.callback_query(F.data.regexp(r"^book:time:(\d{8}):(\d{4})$"))
+async def user_book_time_choice(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    data = await state.get_data()
+    if await state.get_state() != UserBookStates.waiting_start_time.state or not data.get("item_id"):
+        await query.answer("Начните бронирование заново.", show_alert=True)
+        return
+    _, _, raw_day, raw_time = (query.data or "").split(":")
+    try:
+        selected_day = datetime.strptime(raw_day, "%Y%m%d").date()
+    except ValueError:
+        await query.answer("Некорректная дата", show_alert=True)
+        return
+    if data.get("book_date_iso") != selected_day.isoformat():
+        await query.answer("Сначала выберите дату заново.", show_alert=True)
+        return
+    hour, minute = int(raw_time[:2]), int(raw_time[2:])
+    if hour > 23 or minute > 59:
+        await query.answer("Некорректное время", show_alert=True)
+        return
+    parsed = datetime(
+        selected_day.year,
+        selected_day.month,
+        selected_day.day,
+        hour,
+        minute,
+        tzinfo=settings.display_tz,
+    ).astimezone(UTC)
+    await _submit_booking_start(query.message, state, settings, int(data["item_id"]), parsed)
+    await query.answer()
+
+
+@router.message(UserBookStates.waiting_start_time, F.text)
+async def user_book_time_text(message: Message, state: FSMContext, settings: Settings) -> None:
+    data = await state.get_data()
+    raw_day = data.get("book_date_iso")
+    match = re.fullmatch(r"\s*(\d{1,2})\D+(\d{1,2})\s*", message.text or "")
+    if not raw_day or match is None:
+        await message.answer("Введите время в формате <code>ЧЧ:ММ</code>, например <code>13:30</code>.", parse_mode=ParseMode.HTML)
+        return
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        await message.answer("Укажите время от 00:00 до 23:59.")
+        return
+    try:
+        selected_day = date.fromisoformat(str(raw_day))
+    except ValueError:
+        await state.clear()
+        await message.answer("Сессия брони сброшена. Начните с кнопки «Забронировать».", reply_markup=home_keyboard())
+        return
+    parsed = datetime(
+        selected_day.year,
+        selected_day.month,
+        selected_day.day,
+        hour,
+        minute,
+        tzinfo=settings.display_tz,
+    ).astimezone(UTC)
+    await _submit_booking_start(message, state, settings, int(data["item_id"]), parsed)
+
+
+async def _submit_booking_start(
+    message: Message, state: FSMContext, settings: Settings, item_id: int, parsed: datetime
+) -> None:
     now = datetime.now(UTC)
     past_err = reservation_start_in_past_error(parsed, now)
     if past_err is not None:

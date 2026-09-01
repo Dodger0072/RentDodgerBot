@@ -104,7 +104,7 @@ def category_keyboard_for_admin(
     return b.as_markup()
 
 
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
+def admin_panel_keyboard(*, is_superadmin_user: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="Добавить вещь", callback_data="adm:panel:add_item"))
     b.row(InlineKeyboardButton(text="Мои вещи", callback_data="adm:panel:list_items"))
@@ -118,6 +118,8 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="Удалить окно неактива", callback_data="adm:panel:pick_delete_blackout"))
     b.row(InlineKeyboardButton(text="Баны", callback_data="adm:panel:list_bans"))
     b.row(InlineKeyboardButton(text="Предупреждения", callback_data="adm:panel:list_warnings"))
+    if is_superadmin_user:
+        b.row(InlineKeyboardButton(text="Администраторы", callback_data="adm:panel:admins"))
     b.row(InlineKeyboardButton(text="« К каталогу", callback_data="u:home"))
     return b.as_markup()
 
@@ -201,14 +203,14 @@ def admin_hours_keyboard(
 ) -> InlineKeyboardMarkup:
     """Быстрые сроки из допустимого для вещи диапазона; вручную админ может указать любой срок."""
     lo = max(1, int(lo))
-    hi = min(168, int(hi))
+    hi = min(720, int(hi))
     if hi < lo:
         hours: list[int] = []
     elif hi - lo <= 7:
         hours = list(range(lo, hi + 1))
     else:
         # Для широкого диапазона оставляем привычные сроки и обязательно его границы.
-        hours = sorted({lo, hi, *[h for h in (3, 6, 12, 24, 72, 168) if lo <= h <= hi]})
+        hours = sorted({lo, hi, *[h for h in (3, 6, 12, 24, 72, 168, 720) if lo <= h <= hi]})
     if lo <= requested_hours <= hi and requested_hours not in hours:
         hours.append(requested_hours)
         hours.sort()

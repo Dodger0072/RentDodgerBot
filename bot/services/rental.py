@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Item, ItemBlackout, Rental, RentalState, Reservation
 
-MAX_RENT_HOURS = 168
+MAX_RENT_HOURS = 720
+LEGACY_MAX_RENT_HOURS_PAID = 168
 MAX_RENT_HOURS_FREE = 12
 MIN_RENT_HOURS_FREE = 1
 MIN_RENT_HOURS_PAID = 3
@@ -55,7 +56,7 @@ def rent_hours_bounds(item: Item) -> tuple[int, int]:
     if item.rent_hours_min is not None and item.rent_hours_max is not None:
         return item.rent_hours_min, item.rent_hours_max
     if item.is_paid:
-        return MIN_RENT_HOURS_PAID, MAX_RENT_HOURS
+        return MIN_RENT_HOURS_PAID, LEGACY_MAX_RENT_HOURS_PAID
     return MIN_RENT_HOURS_FREE, MAX_RENT_HOURS_FREE
 
 
@@ -89,16 +90,23 @@ def price_for_hours(
         raise ValueError(f"{kind} аренда (эта вещь): от {lo} до {hi} ч.")
     if not item.is_paid:
         return Decimal("0")
-    ph, pd, pw = item.price_hour, item.price_day, item.price_week
-    if ph is None or pd is None or pw is None:
-        raise ValueError("paid item missing prices")
-
-    if hours == 168:
-        total = Decimal(pw)
-    elif 1 <= hours <= 23:
+    ph, pd, pw, pm = item.price_hour, item.price_day, item.price_week, item.price_month
+    if 1 <= hours <= 23:
+        if ph is None:
+            raise ValueError("paid item missing hourly price")
         total = Decimal(ph) * hours
     elif 24 <= hours <= 167:
+        if pd is None:
+            raise ValueError("paid item missing daily price")
         total = (Decimal(hours) / Decimal(24)) * Decimal(pd)
+    elif 168 <= hours <= 719:
+        if pw is None:
+            raise ValueError("paid item missing weekly price")
+        total = (Decimal(hours) / Decimal(168)) * Decimal(pw)
+    elif hours == 720:
+        if pm is None:
+            raise ValueError("paid item missing monthly price")
+        total = Decimal(pm)
     else:
         raise ValueError("invalid hours")
     if not 0 <= int(family_discount_percent) <= 90:

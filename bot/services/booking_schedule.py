@@ -451,6 +451,46 @@ def rent_lo_hi(item: Item) -> tuple[int, int]:
     return rent_hours_bounds(item)
 
 
+async def hourly_booking_start_options(
+    session: AsyncSession,
+    item_id: int,
+    item: Item,
+    day: date,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> list[datetime]:
+    """Свободные начала брони на целый час в указанную локальную дату.
+
+    Это именно подсказки для кнопок: пользователь всё ещё может вручную
+    выбрать любое свободное время с минутами.
+    """
+    now_u = ensure_utc(now) or datetime.now(UTC)
+    local_midnight = datetime(day.year, day.month, day.day, tzinfo=settings.display_tz)
+    local_next_midnight = local_midnight + timedelta(days=1)
+    day_start = local_midnight.astimezone(UTC)
+    day_end = local_next_midnight.astimezone(UTC)
+    rr = await load_rr_busy_intervals_utc(session, item_id)
+    blackouts = merge_intervals_utc(
+        await load_blackout_intervals_utc(
+            session,
+            item_id,
+            range_start=day_start - timedelta(days=1),
+            range_end=day_end + timedelta(days=1),
+        )
+    )
+    lo, hi = rent_lo_hi(item)
+    options: list[datetime] = []
+    for hour in range(24):
+        local_start = datetime(day.year, day.month, day.day, hour, tzinfo=settings.display_tz)
+        start = local_start.astimezone(UTC)
+        if start < now_u or point_inside_busy(start, rr) or point_inside_busy(start, blackouts):
+            continue
+        if max_hours_from_start(start, rr, lo, hi) >= lo:
+            options.append(start)
+    return options
+
+
 _AVAIL_UI_MAX_LINES = 14
 _AVAIL_TAIL_HORIZON_DAYS = 800
 

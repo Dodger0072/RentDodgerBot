@@ -12,6 +12,7 @@ class AddItemStates(StatesGroup):
     price_hour = State()
     price_day = State()
     price_week = State()
+    price_month = State()
     family_discount_percent = State()
 
 
@@ -26,6 +27,7 @@ class EditItemStates(StatesGroup):
     price_hour = State()
     price_day = State()
     price_week = State()
+    price_month = State()
 
 
 class UserRentStates(StatesGroup):
@@ -39,7 +41,8 @@ class UserProfileStates(StatesGroup):
 
 
 class UserBookStates(StatesGroup):
-    waiting_start_datetime = State()
+    waiting_start_date = State()
+    waiting_start_time = State()
     waiting_hours = State()
     waiting_family_discount = State()
     waiting_confirm = State()
@@ -70,3 +73,7 @@ class AdminBlackoutStates(StatesGroup):
 
 class AdminInvoiceStates(StatesGroup):
     waiting_screenshot = State()
+
+
+class AdminRoleStates(StatesGroup):
+    waiting_admin_target = State()

@@ -28,6 +28,7 @@ from bot.db.models import (
     BlackoutWindowItem,
     Item,
     ItemBlackout,
+    ManagedAdmin,
     Rental,
     RentalState,
     Reservation,
@@ -102,11 +103,13 @@ from bot.services.user_discipline import (
     list_users_with_warnings,
     record_successful_handover,
 )
+from bot.services.admin_roles import add_managed_admin, list_managed_admins, remove_managed_admin
 from bot.time_format import format_local_time
 from bot.states import (
     AddItemStates,
     AdminBlackoutStates,
     AdminInvoiceStates,
+    AdminRoleStates,
     AdminRentalStates,
     AdminReservationStates,
     EditItemStates,
@@ -141,6 +144,64 @@ class _PanelMessageProxy:
 def _omit_fsm_keys(d: dict, *keys: str) -> dict:
     drop = set(keys)
     return {k: v for k, v in d.items() if k not in drop}
+
+
+_PRICE_FIELDS = ("price_hour", "price_day", "price_week", "price_month")
+_PRICE_PROMPTS = {
+    "price_hour": "Введите цену за час (число, например 100):",
+    "price_day": "Цена за сутки (24 часа):",
+    "price_week": "Цена за неделю (168 часов):",
+    "price_month": "Цена за месяц (720 часов):",
+}
+
+
+def _price_fields_for_hours(lo: int, hi: int) -> tuple[str, ...]:
+    """Тариф спрашиваем, только если соответствующий срок можно выбрать."""
+    ranges = (
+        ("price_hour", 1, 23),
+        ("price_day", 24, 167),
+        ("price_week", 168, 719),
+        ("price_month", 720, 720),
+    )
+    return tuple(field for field, start, end in ranges if lo <= end and hi >= start)
+
+
+def _state_for_price(flow: type[AddItemStates] | type[EditItemStates], field: str):
+    return getattr(flow, field)
+
+
+async def _ask_first_price(
+    target: Message,
+    state: FSMContext,
+    flow: type[AddItemStates] | type[EditItemStates],
+    lo: int,
+    hi: int,
+) -> None:
+    field = _price_fields_for_hours(lo, hi)[0]
+    await state.set_state(_state_for_price(flow, field))
+    await target.answer(_PRICE_PROMPTS[field])
+
+
+async def _ask_next_price(
+    target: Message,
+    state: FSMContext,
+    flow: type[AddItemStates] | type[EditItemStates],
+    data: dict,
+    current_field: str,
+) -> bool:
+    fields = _price_fields_for_hours(int(data["rent_hours_min"]), int(data["rent_hours_max"]))
+    next_index = fields.index(current_field) + 1
+    if next_index >= len(fields):
+        return False
+    field = fields[next_index]
+    await state.set_state(_state_for_price(flow, field))
+    await target.answer(_PRICE_PROMPTS[field])
+    return True
+
+
+def _price_value(data: dict, field: str) -> Decimal | None:
+    value = data.get(field)
+    return Decimal(value) if value is not None else None
 
 
 def _parse_daily_time_to_minute(text: str) -> int | None:
@@ -199,6 +260,72 @@ async def _safe_query_answer(query: CallbackQuery, *args, **kwargs) -> None:
         if "query is too old" in low or "query id is invalid" in low:
             return
         raise
+
+
+def _admin_roles_keyboard(managed_admins: list[ManagedAdmin]) -> InlineKeyboardBuilder:
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="Добавить администратора", callback_data="adm:admins:add"))
+    for admin in managed_admins:
+        label = f"Удалить #{admin.user_id}"
+        if admin.username:
+            label += f" (@{admin.username})"
+        keyboard.row(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"adm:admins:delete:{admin.user_id}",
+            )
+        )
+    keyboard.row(InlineKeyboardButton(text="« Назад в панель", callback_data="adm:panel"))
+    return keyboard
+
+
+async def _show_admin_roles(target: Message, settings: Settings) -> None:
+    """Показывает все источники админских прав, не смешивая .env и БД."""
+    managed_admins = await list_managed_admins()
+    lines = ["<b>Администраторы</b>"]
+    if settings.superadmin_user_ids:
+        lines.append("\n<b>Суперадмины из .env</b> (полный доступ):")
+        lines.extend(f"• <code>{user_id}</code>" for user_id in sorted(settings.superadmin_user_ids))
+    if settings.configured_admin_user_ids:
+        lines.append("\n<b>Админы из .env</b> (изменяются только в файле):")
+        lines.extend(
+            f"• <code>{user_id}</code>" for user_id in sorted(settings.configured_admin_user_ids)
+        )
+    if settings.configured_admin_usernames:
+        lines.extend(
+            f"• @{escape(username)}" for username in sorted(settings.configured_admin_usernames)
+        )
+    if managed_admins:
+        lines.append("\n<b>Добавлены через бота</b>:")
+        for admin in managed_admins:
+            username = f" (@{escape(admin.username)})" if admin.username else ""
+            lines.append(f"• <code>{admin.user_id}</code>{username}")
+    if len(lines) == 1:
+        lines.append("\nСписок пока пуст.")
+    lines.append("\nАдмины из .env отображаются здесь, но не удаляются через бота.")
+    await target.answer(
+        "\n".join(lines),
+        reply_markup=_admin_roles_keyboard(managed_admins).as_markup(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _admin_target_from_message(message: Message) -> tuple[int, str | None] | None:
+    """Берёт пользователя из пересланного сообщения или из строки '<id> [@username]'."""
+    origin = getattr(message, "forward_origin", None)
+    forwarded_user = getattr(origin, "sender_user", None) or getattr(message, "forward_from", None)
+    if forwarded_user is not None:
+        return int(forwarded_user.id), forwarded_user.username
+
+    match = re.fullmatch(
+        r"\s*(\d{1,19})(?:\s+@?([A-Za-z0-9_]{5,32}))?\s*", message.text or ""
+    )
+    if not match:
+        return None
+    user_id = int(match.group(1))
+    if user_id <= 0 or user_id > 9_223_372_036_854_775_807:
+        return None
+    return user_id, match.group(2)
 
 
 def _admin_panel_pick_item_keyboard(
@@ -352,7 +479,12 @@ async def admin_open_panel(query: CallbackQuery, state: FSMContext, settings: Se
         await query.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    await query.message.answer("Панель администратора:", reply_markup=admin_panel_keyboard())
+    await query.message.answer(
+        "Панель администратора:",
+        reply_markup=admin_panel_keyboard(
+            is_superadmin_user=is_superadmin(query.from_user.id, settings)
+        ),
+    )
     await query.answer()
 
 
@@ -418,10 +550,92 @@ async def admin_panel_action(
         msg.text = "/list_warnings"
         await cmd_list_warnings(msg, settings)
         return
+    if action == "admins":
+        if not is_superadmin(query.from_user.id, settings):
+            await query.message.answer("Управлять администраторами может только суперадмин.")
+            return
+        await _show_admin_roles(query.message, settings)
+        return
     await query.message.answer(
         "Неизвестный пункт панели. Откройте панель заново.",
         reply_markup=category_keyboard_for_admin(is_admin_user=True),
     )
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: Message, state: FSMContext, settings: Settings) -> None:
+    """Список и управление ролями также доступны отдельной командой."""
+    if not is_superadmin(message.from_user.id, settings):
+        return
+    await state.clear()
+    await _show_admin_roles(message, settings)
+
+
+@router.callback_query(F.data == "adm:admins:add")
+async def admin_roles_add_start(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminRoleStates.waiting_admin_target)
+    await query.message.answer(
+        "Перешлите сообщение пользователя или отправьте его Telegram ID.\n"
+        "Можно добавить username после ID: <code>123456789 @username</code>.\n"
+        "Для отмены используйте /start.",
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.message(AdminRoleStates.waiting_admin_target)
+async def admin_roles_add_finish(message: Message, state: FSMContext, settings: Settings) -> None:
+    if not is_superadmin(message.from_user.id, settings):
+        await state.clear()
+        return
+    target = _admin_target_from_message(message)
+    if target is None:
+        await message.answer(
+            "Не удалось получить пользователя. Перешлите его сообщение или отправьте Telegram ID "
+            "(при желании через пробел @username)."
+        )
+        return
+    user_id, username = target
+    username = username.lstrip("@").lower() if username else None
+    if user_id in settings.superadmin_user_ids:
+        await state.clear()
+        await message.answer("Этот пользователь уже суперадмин из .env.")
+        return
+    if user_id in settings.configured_admin_user_ids:
+        await state.clear()
+        await message.answer("Этот пользователь уже админ из .env.")
+        return
+    created = await add_managed_admin(
+        user_id=user_id,
+        username=username,
+        added_by_user_id=message.from_user.id,
+        settings=settings,
+    )
+    await state.clear()
+    label = f" (@{escape(username)})" if username else ""
+    if created:
+        await message.answer(f"Администратор <code>{user_id}</code>{label} добавлен.", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(f"Администратор <code>{user_id}</code>{label} уже был добавлен.", parse_mode=ParseMode.HTML)
+    await _show_admin_roles(message, settings)
+
+
+@router.callback_query(F.data.regexp(r"^adm:admins:delete:(\d+)$"))
+async def admin_roles_delete(query: CallbackQuery, settings: Settings) -> None:
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    user_id = int((query.data or "").rsplit(":", 1)[1])
+    if not await remove_managed_admin(user_id=user_id, settings=settings):
+        await query.answer("Этого администратора уже нет в управляемом списке.", show_alert=True)
+        return
+    await query.answer("Администратор удалён")
+    await query.message.answer(f"Администратор <code>{user_id}</code> удалён.", parse_mode=ParseMode.HTML)
+    await _show_admin_roles(query.message, settings)
 
 
 @router.callback_query(F.data.regexp(r"^adm:panel:pick_delete_owner:(\d+)$"))
@@ -589,12 +803,16 @@ def _edit_item_header_html(item: Item) -> str:
     lo, hi = rent_hours_bounds(item)
     prices = ""
     if item.is_paid:
-        ph = item.price_hour if item.price_hour is not None else Decimal("0")
-        pd = item.price_day if item.price_day is not None else Decimal("0")
-        pw = item.price_week if item.price_week is not None else Decimal("0")
-        prices = (
-            f"\nЦены: {format_money(ph)} / ч, {format_money(pd)} / сут., "
-            f"{format_money(pw)} / нед."
+        tariffs = (
+            (item.price_hour, "ч"),
+            (item.price_day, "сут."),
+            (item.price_week, "нед."),
+            (item.price_month, "мес."),
+        )
+        prices = "\nЦены: " + ", ".join(
+            f"{format_money(price)} / {label}"
+            for price, label in tariffs
+            if price is not None
         )
     return (
         f"<b>Вещь #{item.id}</b> — {escape(item.name)}\n"
@@ -792,6 +1010,7 @@ async def add_item_back_command(message: Message, state: FSMContext, settings: S
         AddItemStates.price_hour,
         AddItemStates.price_day,
         AddItemStates.price_week,
+        AddItemStates.price_month,
         AddItemStates.family_discount_percent,
     ),
     F.text.lower() == "назад",
@@ -847,39 +1066,37 @@ async def _add_item_step_back(
         await state.set_data(_omit_fsm_keys(data, "rent_hours_min"))
         await state.set_state(AddItemStates.rent_hours_min)
         await message.answer(
-            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+            f"Минимальный срок аренды в часах (целое число от 1 до {MAX_RENT_HOURS}):"
         )
         return
-    if st == AddItemStates.price_hour.state:
-        new_data = _omit_fsm_keys(data, "price_hour", "rent_hours_max")
+    if st in {_state_for_price(AddItemStates, field).state for field in _PRICE_FIELDS}:
+        field = next(field for field in _PRICE_FIELDS if st == _state_for_price(AddItemStates, field).state)
+        fields = _price_fields_for_hours(
+            int(data["rent_hours_min"]), int(data["rent_hours_max"])
+        )
+        index = fields.index(field)
+        new_data = _omit_fsm_keys(data, field)
         await state.set_data(new_data)
-        await state.set_state(AddItemStates.rent_hours_max)
-        n = new_data.get("rent_hours_min")
-        if n is None:
-            await state.set_state(AddItemStates.rent_hours_min)
+        if index == 0:
+            await state.set_state(AddItemStates.rent_hours_max)
+            n = new_data.get("rent_hours_min")
             await message.answer(
-                "Минимальный срок аренды в часах (целое число от 1 до 168):"
+                f"Максимальный срок аренды в часах "
+                f"(не меньше {n}, не больше {MAX_RENT_HOURS}):"
             )
             return
-        await message.answer(
-            f"Максимальный срок аренды в часах "
-            f"(не меньше {n}, не больше {MAX_RENT_HOURS}):"
-        )
-        return
-    if st == AddItemStates.price_day.state:
-        await state.set_data(_omit_fsm_keys(data, "price_day"))
-        await state.set_state(AddItemStates.price_hour)
-        await message.answer("Введите цену за час (число, например 100):")
+        previous = fields[index - 1]
+        await state.set_state(_state_for_price(AddItemStates, previous))
+        await message.answer(_PRICE_PROMPTS[previous])
         return
     if st == AddItemStates.family_discount_percent.state:
         await state.set_data(_omit_fsm_keys(data, "family_discount_percent"))
-        await state.set_state(AddItemStates.price_week)
-        await message.answer("Цена за неделю (168 часов):")
-        return
-    if st == AddItemStates.price_week.state:
-        await state.set_data(_omit_fsm_keys(data, "price_week"))
-        await state.set_state(AddItemStates.price_day)
-        await message.answer("Цена за сутки (24 часа):")
+        fields = _price_fields_for_hours(
+            int(data["rent_hours_min"]), int(data["rent_hours_max"])
+        )
+        previous = fields[-1]
+        await state.set_state(_state_for_price(AddItemStates, previous))
+        await message.answer(_PRICE_PROMPTS[previous])
 
 
 @router.message(AddItemStates.name, F.text)
@@ -961,7 +1178,7 @@ async def add_item_rental_kind_cb(query: CallbackQuery, state: FSMContext, setti
     await state.update_data(rental_kind=kind, is_paid=(kind != "free"))
     await state.set_state(AddItemStates.rent_hours_min)
     await query.message.edit_text(
-        "\u041c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u0441\u0440\u043e\u043a \u0430\u0440\u0435\u043d\u0434\u044b \u0432 \u0447\u0430\u0441\u0430\u0445 (\u0446\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 168):"
+        f"\u041c\u0438\u043d\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u0441\u0440\u043e\u043a \u0430\u0440\u0435\u043d\u0434\u044b \u0432 \u0447\u0430\u0441\u0430\u0445 (\u0446\u0435\u043b\u043e\u0435 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e {MAX_RENT_HOURS}):"
     )
     await query.answer()
 
@@ -983,7 +1200,7 @@ async def add_item_rent_hours_min(
     try:
         n = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Нужно целое число часов (от 1 до 168).")
+        await message.answer(f"Нужно целое число часов (от 1 до {MAX_RENT_HOURS}).")
         return
     if n < 1 or n > MAX_RENT_HOURS:
         await message.answer(f"Укажите число от 1 до {MAX_RENT_HOURS}.")
@@ -1018,8 +1235,7 @@ async def add_item_rent_hours_max(
         return
     if data.get("rental_kind") in {"paid", "both"}:
         await state.update_data(rent_hours_max=m)
-        await state.set_state(AddItemStates.price_hour)
-        await message.answer("Введите цену за час (число, например 100):")
+        await _ask_first_price(message, state, AddItemStates, int(n), m)
         return
     async with db_session.async_session_maker() as session:
         ord_val = await next_display_order_for_group(
@@ -1033,6 +1249,7 @@ async def add_item_rent_hours_max(
             price_hour=None,
             price_day=None,
             price_week=None,
+            price_month=None,
             item_category=data.get("item_category"),
             display_order=ord_val,
             owner_user_id=message.from_user.id,
@@ -1046,52 +1263,45 @@ async def add_item_rent_hours_max(
     await message.answer("Вещь добавлена (бесплатная аренда).")
 
 
-@router.message(AddItemStates.price_hour, F.text)
-async def add_item_price_hour(message: Message, state: FSMContext, settings: Settings) -> None:
+async def _add_item_price_entry(
+    message: Message, state: FSMContext, settings: Settings, field: str
+) -> None:
     if not _admin_only(settings, message.from_user.id, message.from_user.username):
         await state.clear()
         return
     try:
         v = Decimal(message.text.strip().replace(",", "."))
     except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за час:")
+        await message.answer(f"Нужно число. {_PRICE_PROMPTS[field]}")
         return
-    await state.update_data(price_hour=str(v))
-    await state.set_state(AddItemStates.price_day)
-    await message.answer("Цена за сутки (24 часа):")
+    await state.update_data(**{field: str(v)})
+    data = await state.get_data()
+    if not await _ask_next_price(message, state, AddItemStates, data, field):
+        await state.set_state(AddItemStates.family_discount_percent)
+        await message.answer(
+            "Укажите скидку для семьи Dodger в процентах — целое число от 0 до 90. "
+            "0 — скидки нет."
+        )
+
+
+@router.message(AddItemStates.price_hour, F.text)
+async def add_item_price_hour(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _add_item_price_entry(message, state, settings, "price_hour")
 
 
 @router.message(AddItemStates.price_day, F.text)
 async def add_item_price_day(message: Message, state: FSMContext, settings: Settings) -> None:
-    if not _admin_only(settings, message.from_user.id, message.from_user.username):
-        await state.clear()
-        return
-    try:
-        v = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за сутки:")
-        return
-    await state.update_data(price_day=str(v))
-    await state.set_state(AddItemStates.price_week)
-    await message.answer("Цена за неделю (168 часов):")
+    await _add_item_price_entry(message, state, settings, "price_day")
 
 
 @router.message(AddItemStates.price_week, F.text)
 async def add_item_price_week(message: Message, state: FSMContext, settings: Settings) -> None:
-    if not _admin_only(settings, message.from_user.id, message.from_user.username):
-        await state.clear()
-        return
-    try:
-        v = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за неделю:")
-        return
-    await state.update_data(price_week=str(v))
-    await state.set_state(AddItemStates.family_discount_percent)
-    await message.answer(
-        "Укажите скидку для семьи Dodger в процентах — целое число от 0 до 90. "
-        "0 — скидки нет."
-    )
+    await _add_item_price_entry(message, state, settings, "price_week")
+
+
+@router.message(AddItemStates.price_month, F.text)
+async def add_item_price_month(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _add_item_price_entry(message, state, settings, "price_month")
 
 
 @router.message(AddItemStates.family_discount_percent, F.text)
@@ -1121,9 +1331,10 @@ async def add_item_family_discount_percent(
             description=data["description"],
             photos_json=json.dumps(data.get("photos") or [], ensure_ascii=False),
             is_paid=True,
-            price_hour=Decimal(data["price_hour"]),
-            price_day=Decimal(data["price_day"]),
-            price_week=Decimal(data["price_week"]),
+            price_hour=_price_value(data, "price_hour"),
+            price_day=_price_value(data, "price_day"),
+            price_week=_price_value(data, "price_week"),
+            price_month=_price_value(data, "price_month"),
             family_discount_percent=discount,
             item_category=data.get("item_category"),
             display_order=paid_order,
@@ -1147,6 +1358,7 @@ async def add_item_family_discount_percent(
                     price_hour=None,
                     price_day=None,
                     price_week=None,
+                    price_month=None,
                     item_category=data.get("item_category"),
                     display_order=free_order,
                     owner_user_id=message.from_user.id,
@@ -1290,6 +1502,7 @@ async def edit_item_action_cb(
             item.price_hour = None
             item.price_day = None
             item.price_week = None
+            item.price_month = None
             item.display_order = await next_display_order_for_group(
                 session, is_paid=False, item_category=item.item_category
             )
@@ -1329,7 +1542,7 @@ async def edit_item_action_cb(
         await state.set_state(EditItemStates.rent_hours_min)
         await state.update_data(edit_item_id=iid, edit_flow="topaid")
         await query.message.answer(
-            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+            f"Минимальный срок аренды в часах (целое число от 1 до {MAX_RENT_HOURS}):"
         )
         return
 
@@ -1367,15 +1580,20 @@ async def edit_item_action_cb(
         await state.set_state(EditItemStates.rent_hours_min)
         await state.update_data(edit_item_id=iid, edit_flow="rent")
         await query.message.answer(
-            "Минимальный срок аренды в часах (целое число от 1 до 168):"
+            f"Минимальный срок аренды в часах (целое число от 1 до {MAX_RENT_HOURS}):"
         )
         await query.answer()
         return
     if action == "prices":
         await query.answer()
-        await state.set_state(EditItemStates.price_hour)
-        await state.update_data(edit_item_id=iid, edit_flow="prices")
-        await query.message.answer("Введите цену за час (число, например 100):")
+        lo, hi = rent_hours_bounds(item)
+        await state.update_data(
+            edit_item_id=iid,
+            edit_flow="prices",
+            rent_hours_min=lo,
+            rent_hours_max=hi,
+        )
+        await _ask_first_price(query.message, state, EditItemStates, lo, hi)
         return
 
     await query.answer("Неизвестное действие", show_alert=True)
@@ -1564,7 +1782,7 @@ async def edit_item_rent_hours_min(
     try:
         n = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Нужно целое число часов (от 1 до 168).")
+        await message.answer(f"Нужно целое число часов (от 1 до {MAX_RENT_HOURS}).")
         return
     if n < 1 or n > MAX_RENT_HOURS:
         await message.answer(f"Укажите число от 1 до {MAX_RENT_HOURS}.")
@@ -1602,8 +1820,7 @@ async def edit_item_rent_hours_max(
 
     if flow == "topaid":
         await state.update_data(rent_hours_max=m)
-        await state.set_state(EditItemStates.price_hour)
-        await message.answer("Введите цену за час (число, например 100):")
+        await _ask_first_price(message, state, EditItemStates, int(n), m)
         return
 
     async with db_session.async_session_maker() as session:
@@ -1629,47 +1846,9 @@ async def edit_item_rent_hours_max(
     )
 
 
-@router.message(EditItemStates.price_hour, F.text)
-async def edit_item_price_hour(message: Message, state: FSMContext, settings: Settings) -> None:
-    if not _admin_only(settings, message.from_user.id, message.from_user.username):
-        await state.clear()
-        return
-    try:
-        v = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за час:")
-        return
-    await state.update_data(price_hour=str(v))
-    await state.set_state(EditItemStates.price_day)
-    await message.answer("Цена за сутки (24 часа):")
-
-
-@router.message(EditItemStates.price_day, F.text)
-async def edit_item_price_day(message: Message, state: FSMContext, settings: Settings) -> None:
-    if not _admin_only(settings, message.from_user.id, message.from_user.username):
-        await state.clear()
-        return
-    try:
-        v = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за сутки:")
-        return
-    await state.update_data(price_day=str(v))
-    await state.set_state(EditItemStates.price_week)
-    await message.answer("Цена за неделю (168 часов):")
-
-
-@router.message(EditItemStates.price_week, F.text)
-async def edit_item_price_week(message: Message, state: FSMContext, settings: Settings) -> None:
-    if not _admin_only(settings, message.from_user.id, message.from_user.username):
-        await state.clear()
-        return
-    try:
-        v = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("Нужно число. Повторите цену за неделю:")
-        return
-    data = await state.get_data()
+async def _finish_edit_item_prices(
+    message: Message, state: FSMContext, settings: Settings, data: dict
+) -> None:
     iid = data.get("edit_item_id")
     flow = data.get("edit_flow")
     if iid is None or flow not in ("prices", "topaid"):
@@ -1692,31 +1871,60 @@ async def edit_item_price_week(message: Message, state: FSMContext, settings: Se
                 await state.clear()
                 await message.answer("Вещь не в платной аренде — цены не сохранены.")
                 return
-            item.price_hour = Decimal(data["price_hour"])
-            item.price_day = Decimal(data["price_day"])
-            item.price_week = v
         else:
             item.rent_hours_min = int(data["rent_hours_min"])
             item.rent_hours_max = int(data["rent_hours_max"])
-            item.price_hour = Decimal(data["price_hour"])
-            item.price_day = Decimal(data["price_day"])
-            item.price_week = v
             item.is_paid = True
             item.display_order = await next_display_order_for_group(
                 session, is_paid=True, item_category=item.item_category
             )
+        fields = _price_fields_for_hours(*rent_hours_bounds(item))
+        for field in _PRICE_FIELDS:
+            setattr(item, field, _price_value(data, field) if field in fields else None)
         await session.commit()
         paid = bool(item.is_paid)
     await state.clear()
-    done = (
-        "Цены обновлены."
-        if flow == "prices"
-        else "Вещь переведена в платную аренду."
-    )
     await message.answer(
-        done,
+        "Цены обновлены." if flow == "prices" else "Вещь переведена в платную аренду.",
         reply_markup=edit_item_menu_keyboard(int(iid), is_paid=paid),
     )
+
+
+async def _edit_item_price_entry(
+    message: Message, state: FSMContext, settings: Settings, field: str
+) -> None:
+    if not _admin_only(settings, message.from_user.id, message.from_user.username):
+        await state.clear()
+        return
+    try:
+        v = Decimal(message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await message.answer(f"Нужно число. {_PRICE_PROMPTS[field]}")
+        return
+    await state.update_data(**{field: str(v)})
+    data = await state.get_data()
+    if not await _ask_next_price(message, state, EditItemStates, data, field):
+        await _finish_edit_item_prices(message, state, settings, data)
+
+
+@router.message(EditItemStates.price_hour, F.text)
+async def edit_item_price_hour(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _edit_item_price_entry(message, state, settings, "price_hour")
+
+
+@router.message(EditItemStates.price_day, F.text)
+async def edit_item_price_day(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _edit_item_price_entry(message, state, settings, "price_day")
+
+
+@router.message(EditItemStates.price_week, F.text)
+async def edit_item_price_week(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _edit_item_price_entry(message, state, settings, "price_week")
+
+
+@router.message(EditItemStates.price_month, F.text)
+async def edit_item_price_month(message: Message, state: FSMContext, settings: Settings) -> None:
+    await _edit_item_price_entry(message, state, settings, "price_month")
 
 
 @router.message(Command("list_items"))
