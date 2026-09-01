@@ -32,6 +32,29 @@ def _parse_username_list(raw: str | None) -> set[str]:
     return {p.strip().lstrip("@").lower() for p in raw.split(",") if p.strip()}
 
 
+def _parse_configured_admin_entries(
+    ids_raw: str | None, usernames_raw: str | None
+) -> list[tuple[int | None, str | None]]:
+    """Сохраняет порядок .env: ID и username в одинаковой позиции — одна персона."""
+    raw_ids = (ids_raw or "").split(",")
+    raw_usernames = (usernames_raw or "").split(",")
+    entries: list[tuple[int | None, str | None]] = []
+    for index in range(max(len(raw_ids), len(raw_usernames))):
+        user_id: int | None = None
+        username: str | None = None
+        if index < len(raw_ids) and raw_ids[index].strip():
+            try:
+                user_id = int(raw_ids[index].strip())
+            except ValueError:
+                pass
+        if index < len(raw_usernames):
+            value = raw_usernames[index].strip().lstrip("@").lower()
+            username = value or None
+        if user_id is not None or username is not None:
+            entries.append((user_id, username))
+    return entries
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -51,6 +74,7 @@ class Settings:
     admin_usernames: set[str]
     configured_admin_user_ids: set[int]
     configured_admin_usernames: set[str]
+    configured_admin_entries: list[tuple[int | None, str | None]]
     superadmin_user_ids: set[int]
     database_url: str
     display_tz: ZoneInfo
@@ -100,6 +124,9 @@ def load_settings() -> Settings:
 
     admin_user_ids = _parse_int_list(os.getenv("ADMIN_USER_IDS"))
     admin_usernames = _parse_username_list(os.getenv("ADMIN_USERNAMES"))
+    configured_admin_entries = _parse_configured_admin_entries(
+        os.getenv("ADMIN_USER_IDS"), os.getenv("ADMIN_USERNAMES")
+    )
 
     return Settings(
         bot_token=token,
@@ -108,6 +135,7 @@ def load_settings() -> Settings:
         admin_usernames=set(admin_usernames),
         configured_admin_user_ids=admin_user_ids,
         configured_admin_usernames=admin_usernames,
+        configured_admin_entries=configured_admin_entries,
         superadmin_user_ids=_parse_int_list(os.getenv("SUPERADMIN_USER_IDS")),
         database_url=db,
         display_tz=tz,

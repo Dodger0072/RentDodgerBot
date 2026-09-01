@@ -286,15 +286,12 @@ async def _show_admin_roles(target: Message, settings: Settings) -> None:
     if settings.superadmin_user_ids:
         lines.append("\n<b>Суперадмины из .env</b> (полный доступ):")
         lines.extend(f"• <code>{user_id}</code>" for user_id in sorted(settings.superadmin_user_ids))
-    if settings.configured_admin_user_ids:
+    if settings.configured_admin_entries:
         lines.append("\n<b>Админы из .env</b> (изменяются только в файле):")
-        lines.extend(
-            f"• <code>{user_id}</code>" for user_id in sorted(settings.configured_admin_user_ids)
-        )
-    if settings.configured_admin_usernames:
-        lines.extend(
-            f"• @{escape(username)}" for username in sorted(settings.configured_admin_usernames)
-        )
+        for user_id, username in settings.configured_admin_entries:
+            id_label = f"<code>{user_id}</code>" if user_id is not None else "без ID"
+            username_label = f"@{escape(username)}" if username else "без username"
+            lines.append(f"• {id_label} — {username_label}")
     if managed_admins:
         lines.append("\n<b>Добавлены через бота</b>:")
         for admin in managed_admins:
