@@ -436,9 +436,9 @@ def _booking_date_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     for offset in range(6):
         day = today + timedelta(days=offset)
         if offset == 0:
-            label = f"Сегодня ({day:%d.%m})"
+            label = "Сегодня"
         elif offset == 1:
-            label = f"Завтра ({day:%d.%m})"
+            label = "Завтра"
         else:
             label = f"{day.day} {_RU_MONTHS_GENITIVE[day.month - 1]}"
         keyboard.row(
