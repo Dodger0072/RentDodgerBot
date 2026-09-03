@@ -262,9 +262,45 @@ async def _safe_query_answer(query: CallbackQuery, *args, **kwargs) -> None:
         raise
 
 
-def _admin_roles_keyboard(managed_admins: list[ManagedAdmin]) -> InlineKeyboardBuilder:
+def _admin_role_item_rows(
+    settings: Settings, managed_admins: list[ManagedAdmin]
+) -> list[tuple[int, str | None]]:
+    """Уникальные админы с Telegram ID — только их вещи можно найти в БД."""
+    rows: list[tuple[int, str | None]] = []
+    position_by_id: dict[int, int] = {}
+
+    def add(user_id: int | None, username: str | None) -> None:
+        if user_id is None:
+            return
+        uid = int(user_id)
+        if uid in position_by_id:
+            index = position_by_id[uid]
+            if username and not rows[index][1]:
+                rows[index] = (uid, username)
+            return
+        position_by_id[uid] = len(rows)
+        rows.append((uid, username))
+
+    for user_id, username in settings.configured_admin_entries:
+        add(user_id, username)
+    for admin in managed_admins:
+        add(int(admin.user_id), admin.username)
+    for user_id in sorted(settings.superadmin_user_ids):
+        add(user_id, None)
+    return rows
+
+
+def _admin_roles_keyboard(settings: Settings, managed_admins: list[ManagedAdmin]) -> InlineKeyboardBuilder:
     keyboard = InlineKeyboardBuilder()
     keyboard.row(InlineKeyboardButton(text="Добавить администратора", callback_data="adm:admins:add"))
+    for user_id, username in _admin_role_item_rows(settings, managed_admins):
+        label = f"@{username}" if username else f"ID {user_id}"
+        keyboard.row(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"adm:admins:items:{user_id}",
+            )
+        )
     for admin in managed_admins:
         label = f"Удалить #{admin.user_id}"
         if admin.username:
@@ -302,7 +338,7 @@ async def _show_admin_roles(target: Message, settings: Settings) -> None:
     lines.append("\nАдмины из .env отображаются здесь, но не удаляются через бота.")
     await target.answer(
         "\n".join(lines),
-        reply_markup=_admin_roles_keyboard(managed_admins).as_markup(),
+        reply_markup=_admin_roles_keyboard(settings, managed_admins).as_markup(),
         parse_mode=ParseMode.HTML,
     )
 
@@ -633,6 +669,41 @@ async def admin_roles_delete(query: CallbackQuery, settings: Settings) -> None:
     await query.answer("Администратор удалён")
     await query.message.answer(f"Администратор <code>{user_id}</code> удалён.", parse_mode=ParseMode.HTML)
     await _show_admin_roles(query.message, settings)
+
+
+@router.callback_query(F.data.regexp(r"^adm:admins:items:(\d+)$"))
+async def admin_roles_items(query: CallbackQuery, settings: Settings) -> None:
+    """Список вещей выбранного администратора доступен только суперадмину."""
+    if not is_superadmin(query.from_user.id, settings):
+        await query.answer("Только суперадмин", show_alert=True)
+        return
+    owner_user_id = int((query.data or "").rsplit(":", 1)[1])
+    async with db_session.async_session_maker() as session:
+        result = await session.execute(
+            select(Item)
+            .where(Item.owner_user_id == owner_user_id)
+            .order_by(Item.display_order.asc(), Item.id.asc())
+        )
+        items = list(result.scalars().unique())
+        await session.commit()
+    username = next(
+        (str(item.owner_username).strip().lstrip("@") for item in items if item.owner_username),
+        "",
+    )
+    owner_label = f"@{escape(username)}" if username else f"id <code>{owner_user_id}</code>"
+    if not items:
+        text = f"У администратора {owner_label} пока нет добавленных вещей."
+    else:
+        lines = [f"<b>Вещи администратора {owner_label}</b>:"]
+        for item in items:
+            rental_kind = "платная" if item.is_paid else "бесплатная"
+            visibility = "видна" if item.is_visible else "скрыта"
+            lines.append(f"• #{item.id} {escape(item.name)} — {rental_kind}, {visibility}")
+        text = "\n".join(lines)
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="« К администраторам", callback_data="adm:panel:admins"))
+    await query.message.answer(text, reply_markup=keyboard.as_markup(), parse_mode=ParseMode.HTML)
+    await query.answer()
 
 
 @router.callback_query(F.data.regexp(r"^adm:panel:pick_delete_owner:(\d+)$"))
