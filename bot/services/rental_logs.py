@@ -65,12 +65,12 @@ async def admins_with_log_activity(session: AsyncSession) -> list[AdminLogOwnerR
     )
     out: list[AdminLogOwnerRow] = []
     for uid, uname in q.all():
-        out.append(
-            AdminLogOwnerRow(
-                user_id=int(uid),
-                username=str(uname or "").strip().lstrip("@"),
-            )
-        )
+        username = str(uname or "").strip().lstrip("@")
+        # В выборе логов показываем только админов, которых можно опознать
+        # по Telegram username; старые записи без него намеренно скрыты.
+        if not username:
+            continue
+        out.append(AdminLogOwnerRow(user_id=int(uid), username=username))
     return out
 
 
